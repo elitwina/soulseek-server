@@ -77,17 +77,21 @@ def _quality_tuple(filename: str, size: int, ext: str, sim: float, preferred_for
 	if preferred_format:
 		pref = preferred_format.lower()
 		if pref == "mp3":
-			# Priority: mp3 320 > flac > wav > mp3 other > rest
+			# Priority: mp3 320 > flac > wav > mp3 256/192 > rest
 			if ext_lower == "mp3":
 				bitrate = _infer_mp3_bitrate_from_name(filename)
 				if bitrate >= 320:
 					return (10, bitrate, size, sim)  # Highest priority for mp3 320
+				elif bitrate >= 256:
+					return (3, bitrate, size, sim)  # Low priority for mp3 256 (only if mp3 preferred)
+				elif bitrate >= 192:
+					return (2, bitrate, size, sim)  # Very low priority for mp3 192 (only if mp3 preferred)
 				else:
-					return (5, bitrate, size, sim)  # Lower priority for other mp3
+					return (1, bitrate, size, sim)  # Lowest priority for other mp3
 			elif ext_lower == "flac":
-				return (8, 0, size, sim)  # Second priority
+				return (9, 0, size, sim)  # Second priority (after mp3 320)
 			elif ext_lower == "wav":
-				return (7, 0, size, sim)  # Third priority
+				return (8, 0, size, sim)  # Third priority
 			else:
 				return (0, 0, size, sim)
 		elif pref == "flac":
@@ -123,9 +127,8 @@ def _is_high_quality(filename: str, size: int, ext: str, sim: float) -> bool:
 		return size >= 20_000_000 and sim >= 0.75
 	if ext == "mp3":
 		br = _infer_mp3_bitrate_from_name(filename)
-		# Prefer 320kbps; allow 256 if large enough and similar
-		return ((br >= 320 and size >= 6_000_000 and sim >= 0.75) or
-				(br >= 256 and size >= 8_000_000 and sim >= 0.80))
+		# Only 320kbps passes quality gate
+		return (br >= 320 and size >= 4_000_000 and sim >= 0.65)
 	return False
 
 
@@ -254,13 +257,64 @@ class SoulseekService:
 					# Apply high-quality gate for initial selection
 					hq = [x for x in filtered if _is_high_quality(x[1], x[2], x[3], x[4])]
 					if hq:
-						yield DownloadEvent(kind="status", message=f"using {len(hq)} high-quality candidates")
-						candidates = hq
+						# If preferred_format is mp3, prioritize MP3 320 from HQ candidates
+						if preferred_format and preferred_format.lower() == "mp3":
+							mp3_320_hq = [x for x in hq if x[3].lower() == "mp3" and _infer_mp3_bitrate_from_name(x[1]) >= 320]
+							if mp3_320_hq:
+								candidates = mp3_320_hq
+								yield DownloadEvent(kind="status", message=f"using {len(candidates)} MP3 320 HQ candidates (preferred format)")
+							else:
+								# No MP3 320 in HQ, use FLAC/WAV from HQ, but prepare fallback to MP3 256/192
+								candidates = hq
+								yield DownloadEvent(kind="status", message=f"using {len(hq)} high-quality candidates (no MP3 320 found)")
+								# Store filtered for fallback if HQ fails - check all collected files, not just filtered
+								# Use with_scores (all collected files) to find MP3 256/192 even if they didn't pass similarity filter
+								all_mp3s = [x for x in with_scores if x[3].lower() == "mp3" and x[2] >= 3_000_000 and x not in hq]
+								# Prioritize MP3s with known bitrate >= 192, but also include others with reasonable size
+								fallback_mp3_known = [x for x in all_mp3s if _infer_mp3_bitrate_from_name(x[1]) >= 192]
+								fallback_mp3_unknown = [x for x in all_mp3s if _infer_mp3_bitrate_from_name(x[1]) == 0 and x[2] >= 4_000_000]  # Unknown bitrate but reasonable size
+								fallback_mp3 = fallback_mp3_known + fallback_mp3_unknown
+								if fallback_mp3:
+									# Sort by bitrate (known first) and similarity
+									fallback_mp3.sort(key=lambda x: (_infer_mp3_bitrate_from_name(x[1]) if _infer_mp3_bitrate_from_name(x[1]) > 0 else 0, x[4]), reverse=True)
+									# Append MP3 256/192 as fallback after HQ candidates
+									candidates = candidates + fallback_mp3
+									yield DownloadEvent(kind="status", message=f"Added {len(fallback_mp3)} MP3 candidates as fallback ({len(fallback_mp3_known)} with known bitrate, {len(fallback_mp3_unknown)} unknown bitrate, {len(all_mp3s)} total MP3s)")
+								else:
+									yield DownloadEvent(kind="status", message=f"No MP3 fallback found (found {len(all_mp3s)} total MP3s)")
+						else:
+							candidates = hq
+							yield DownloadEvent(kind="status", message=f"using {len(hq)} high-quality candidates")
 					else:
-						# Fallback: skip obviously low-quality (tiny/low-bitrate-looking) files
-						fallback = [x for x in filtered if x[2] >= 3_000_000]
-						candidates = fallback or filtered
-						yield DownloadEvent(kind="status", message=f"no HQ found; using {len(candidates)} filtered candidates")
+						# Fallback: if preferred_format is mp3, try in order: MP3 320 > FLAC > MP3 256/192
+						if preferred_format and preferred_format.lower() == "mp3":
+							# Try MP3 320 first
+							mp3_320 = [x for x in filtered if x[3].lower() == "mp3" and _infer_mp3_bitrate_from_name(x[1]) >= 320 and x[2] >= 3_000_000]
+							if mp3_320:
+								candidates = mp3_320
+								yield DownloadEvent(kind="status", message=f"no HQ found; using {len(candidates)} MP3 320 candidates (preferred format)")
+							else:
+								# Try FLAC second
+								flac_candidates = [x for x in filtered if x[3].lower() == "flac" and x[2] >= 3_000_000]
+								if flac_candidates:
+									candidates = flac_candidates
+									yield DownloadEvent(kind="status", message=f"no MP3 320 found; using {len(candidates)} FLAC candidates")
+								else:
+									# Try MP3 256/192 last
+									mp3_lower = [x for x in filtered if x[3].lower() == "mp3" and _infer_mp3_bitrate_from_name(x[1]) >= 192 and x[2] >= 3_000_000]
+									if mp3_lower:
+										candidates = mp3_lower
+										yield DownloadEvent(kind="status", message=f"no MP3 320/FLAC found; using {len(candidates)} MP3 256/192 candidates")
+									else:
+										# Final fallback
+										fallback = [x for x in filtered if x[2] >= 3_000_000]
+										candidates = fallback or filtered
+										yield DownloadEvent(kind="status", message=f"no preferred format found; using {len(candidates)} filtered candidates")
+						else:
+							# Fallback: skip obviously low-quality (tiny/low-bitrate-looking) files
+							fallback = [x for x in filtered if x[2] >= 3_000_000]
+							candidates = fallback or filtered
+							yield DownloadEvent(kind="status", message=f"no HQ found; using {len(candidates)} filtered candidates")
 
 					# Track users that have already failed to avoid retrying them
 					failed_users = set()
