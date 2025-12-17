@@ -51,12 +51,17 @@ def http_start_download():
 		"finished": False,
 	}
 
-	svc = SoulseekService(USERNAME, PASSWORD, DOWNLOAD_DIR, search_timeout=20)
+	preferred_format = data.get("format", "").strip().lower()  # "mp3" or "flac"
+	if preferred_format and preferred_format not in ("mp3", "flac"):
+		preferred_format = None
+	
+	svc = SoulseekService(USERNAME, PASSWORD, DOWNLOAD_DIR, search_timeout=10)
 
 	async def run_job():
-		print(f"[JOB {job_id}] Starting download for: {query}")
+		format_msg = f" (preferred: {preferred_format})" if preferred_format else ""
+		print(f"[JOB {job_id}] Starting download for: {query}{format_msg}")
 		try:
-			async for ev in svc.download(query):
+			async for ev in svc.download(query, preferred_format=preferred_format if preferred_format else None):
 				print(f"[JOB {job_id}] Event received: {ev.kind} - {ev.message}")
 				# Track path/finished for streaming
 				if ev.kind == "started" and ev.path:

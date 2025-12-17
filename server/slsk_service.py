@@ -70,9 +70,44 @@ def _infer_mp3_bitrate_from_name(name: str) -> int:
 	return 0
 
 
-def _quality_tuple(filename: str, size: int, ext: str, sim: float):
+def _quality_tuple(filename: str, size: int, ext: str, sim: float, preferred_format: Optional[str] = None):
+	ext_lower = ext.lower()
+	
+	# If preferred_format is specified, adjust priority
+	if preferred_format:
+		pref = preferred_format.lower()
+		if pref == "mp3":
+			# Priority: mp3 320 > flac > wav > mp3 other > rest
+			if ext_lower == "mp3":
+				bitrate = _infer_mp3_bitrate_from_name(filename)
+				if bitrate >= 320:
+					return (10, bitrate, size, sim)  # Highest priority for mp3 320
+				else:
+					return (5, bitrate, size, sim)  # Lower priority for other mp3
+			elif ext_lower == "flac":
+				return (8, 0, size, sim)  # Second priority
+			elif ext_lower == "wav":
+				return (7, 0, size, sim)  # Third priority
+			else:
+				return (0, 0, size, sim)
+		elif pref == "flac":
+			# Priority: flac > wav > mp3 320 > mp3 other > rest
+			if ext_lower == "flac":
+				return (10, 0, size, sim)  # Highest priority for flac
+			elif ext_lower == "wav":
+				return (8, 0, size, sim)  # Second priority
+			elif ext_lower == "mp3":
+				bitrate = _infer_mp3_bitrate_from_name(filename)
+				if bitrate >= 320:
+					return (7, bitrate, size, sim)  # Third priority for mp3 320
+				else:
+					return (5, bitrate, size, sim)  # Lower priority for other mp3
+			else:
+				return (0, 0, size, sim)
+	
+	# Default behavior (no preference)
 	codec = _codec_priority(ext)
-	if ext == "mp3":
+	if ext_lower == "mp3":
 		bitrate_hint = _infer_mp3_bitrate_from_name(filename)
 		return (codec, bitrate_hint, size, sim)
 	return (codec, 0, size, sim)
@@ -109,7 +144,7 @@ class SoulseekService:
 		self.download_dir = download_dir
 		self.search_timeout = search_timeout
 
-	async def _download_one(self, query: str) -> AsyncIterator[DownloadEvent]:
+	async def _download_one(self, query: str, preferred_format: Optional[str] = None) -> AsyncIterator[DownloadEvent]:
 		os.makedirs(self.download_dir, exist_ok=True)
 		settings = Settings(credentials=CredentialsSettings(username=self.username, password=self.password))
 		settings.shares.download = self.download_dir
@@ -194,7 +229,7 @@ class SoulseekService:
 					max_sim = max(x[4] for x in with_scores) if with_scores else 0
 					# Be more lenient with similarity - use 0.15 instead of 0.05 to include more results
 					filtered = [x for x in with_scores if x[4] >= max_sim - 0.15]
-					filtered.sort(key=lambda x: _quality_tuple(x[1], x[2], x[3], x[4]))
+					filtered.sort(key=lambda x: _quality_tuple(x[1], x[2], x[3], x[4], preferred_format))
 					filtered = list(reversed(filtered))
 
 					# Deduplicate by username: keep only the best candidate per user
@@ -413,6 +448,6 @@ class SoulseekService:
 					yield DownloadEvent(kind="error", message=f"Failed to connect: {e}")
 					return
 
-	async def download(self, query: str) -> AsyncIterator[DownloadEvent]:
-		async for ev in self._download_one(query):
+	async def download(self, query: str, preferred_format: Optional[str] = None) -> AsyncIterator[DownloadEvent]:
+		async for ev in self._download_one(query, preferred_format):
 			yield ev
