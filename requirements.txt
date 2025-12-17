@@ -1,0 +1,5 @@
+# Server requirements
+aioslsk
+flask
+flask-socketio
+python-socketio

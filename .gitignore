@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+*.pid
+
+# Downloads
+downloads/
+*.mp3
+*.flac
+*.wav
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Server specific
+server/downloads/
+server/*.log
+server/*.pid
+
+# Client specific - exclude entire client directory from deployment
+/client/
+client/
+

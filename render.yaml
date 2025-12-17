@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: soulseek-server
+    env: python
+    buildCommand: pip install -r server/requirements.txt
+    startCommand: cd server && python server.py
+    envVars:
+      - key: USERNAME
+        value: DjLic
+      - key: PASSWORD
+        value: DjLic
+      - key: PORT
+        value: 8001
+    plan: starter  # $7/חודש - always-on, או free (עם sleep)
+
