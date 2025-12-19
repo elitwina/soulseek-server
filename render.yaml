@@ -13,3 +13,5 @@ services:
         value: 8001
     plan: starter  # $7/חודש - always-on, או free (עם sleep)
 
+
+

@@ -60,3 +60,5 @@ SERVER = "https://YOUR_APP_NAME.up.railway.app"
 - השרת לא יתאפס כל 24 שעות
 - Railway נותן $5 credit חינמי כל חודש
 
+
+
