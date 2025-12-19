@@ -134,10 +134,11 @@ def _is_high_quality(filename: str, size: int, ext: str, sim: float) -> bool:
 
 @dataclass
 class DownloadEvent:
-	kind: str  # 'status' | 'progress' | 'finished' | 'error' | 'started'
+	kind: str  # 'status' | 'progress' | 'finished' | 'error' | 'started' | 'files_list'
 	message: str = ""
 	percent: Optional[int] = None
 	path: Optional[str] = None
+	files_list: Optional[list[str]] = None  # List of candidate file names for client to check
 
 
 class SoulseekService:
@@ -147,7 +148,7 @@ class SoulseekService:
 		self.download_dir = download_dir
 		self.search_timeout = search_timeout
 
-	async def _download_one(self, query: str, preferred_format: Optional[str] = None) -> AsyncIterator[DownloadEvent]:
+	async def _download_one(self, query: str, preferred_format: Optional[str] = None, confirmation_event: Optional[asyncio.Event] = None) -> AsyncIterator[DownloadEvent]:
 		os.makedirs(self.download_dir, exist_ok=True)
 		settings = Settings(credentials=CredentialsSettings(username=self.username, password=self.password))
 		settings.shares.download = self.download_dir
@@ -316,6 +317,22 @@ class SoulseekService:
 							candidates = fallback or filtered
 							yield DownloadEvent(kind="status", message=f"no HQ found; using {len(candidates)} filtered candidates")
 
+					# Send list of candidate file names to client for existence check
+					candidate_filenames = [x[1] for x in candidates]  # Extract just the filenames
+					yield DownloadEvent(kind="files_list", files_list=candidate_filenames, message=f"Found {len(candidate_filenames)} candidate files")
+					
+					# Wait for client confirmation before starting download
+					if confirmation_event:
+						yield DownloadEvent(kind="status", message="Waiting for client confirmation...")
+						try:
+							await asyncio.wait_for(confirmation_event.wait(), timeout=30.0)
+							if not confirmation_event.is_set():
+								yield DownloadEvent(kind="error", message="Confirmation timeout")
+								return
+						except asyncio.TimeoutError:
+							yield DownloadEvent(kind="error", message="Confirmation timeout")
+							return
+					
 					# Track users that have already failed to avoid retrying them
 					failed_users = set()
 					
@@ -502,6 +519,6 @@ class SoulseekService:
 					yield DownloadEvent(kind="error", message=f"Failed to connect: {e}")
 					return
 
-	async def download(self, query: str, preferred_format: Optional[str] = None) -> AsyncIterator[DownloadEvent]:
-		async for ev in self._download_one(query, preferred_format):
+	async def download(self, query: str, preferred_format: Optional[str] = None, confirmation_event: Optional[asyncio.Event] = None) -> AsyncIterator[DownloadEvent]:
+		async for ev in self._download_one(query, preferred_format, confirmation_event):
 			yield ev

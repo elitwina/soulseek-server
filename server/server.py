@@ -44,11 +44,14 @@ def http_start_download():
 
 	job_id = os.urandom(6).hex()
 	queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+	confirmation_event = asyncio.Event()
 	_jobs[job_id] = {
 		"query": query,
 		"queue": queue,
 		"path": None,
 		"finished": False,
+		"confirmation": confirmation_event,
+		"confirmed": False,
 	}
 
 	preferred_format = data.get("format", "").strip().lower()  # "mp3" or "flac"
@@ -61,7 +64,7 @@ def http_start_download():
 		format_msg = f" (preferred: {preferred_format})" if preferred_format else ""
 		print(f"[JOB {job_id}] Starting download for: {query}{format_msg}")
 		try:
-			async for ev in svc.download(query, preferred_format=preferred_format if preferred_format else None):
+			async for ev in svc.download(query, preferred_format=preferred_format if preferred_format else None, confirmation_event=confirmation_event):
 				print(f"[JOB {job_id}] Event received: {ev.kind} - {ev.message}")
 				# Track path/finished for streaming
 				if ev.kind == "started" and ev.path:
@@ -131,6 +134,26 @@ def on_subscribe(data):
 				break
 	
 	socketio.start_background_task(send_events)
+
+@socketio.on("confirm_download")
+def on_confirm_download(data):
+	job_id = data.get("job_id")
+	sid = request.sid
+	print(f"[WS] Confirm download request for job: {job_id} from sid: {sid}")
+	if not job_id or job_id not in _jobs:
+		emit("error", {"kind": "error", "message": "unknown job_id"})
+		return
+	
+	job = _jobs[job_id]
+	confirmation_event = job.get("confirmation")
+	if confirmation_event:
+		job["confirmed"] = True
+		# Signal the confirmation event in the event loop
+		asyncio.run_coroutine_threadsafe(confirmation_event.set(), _loop)
+		print(f"[WS] Download confirmed for job: {job_id}")
+		emit("progress", {"kind": "status", "message": "Download confirmed, starting..."}, room=sid)
+	else:
+		emit("error", {"kind": "error", "message": "no confirmation event for this job"})
 
 @app.get("/stream/<job_id>")
 def http_stream_file(job_id: str):
