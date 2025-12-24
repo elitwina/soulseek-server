@@ -145,8 +145,11 @@ def http_start_download():
 @app.get("/poll/<job_id>")
 def http_poll_job(job_id: str):
 	"""HTTP polling endpoint for clients that don't support WebSocket"""
+	print(f"[HTTP POLL] GET /poll/{job_id} received", flush=True)
+	print(f"[HTTP POLL] Available jobs: {list(_jobs.keys())}", flush=True)
 	job = _jobs.get(job_id)
 	if not job:
+		print(f"[HTTP POLL] Job {job_id} not found", flush=True)
 		return {"error": "unknown job_id"}, 404
 	
 	queue: asyncio.Queue = job["queue"]
