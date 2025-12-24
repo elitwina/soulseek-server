@@ -142,6 +142,43 @@ def http_start_download():
 		print(f"[JOB {job_id}] Task error: {e}")
 	return {"job_id": job_id}
 
+@app.get("/poll/<job_id>")
+def http_poll_job(job_id: str):
+	"""HTTP polling endpoint for clients that don't support WebSocket"""
+	job = _jobs.get(job_id)
+	if not job:
+		return {"error": "unknown job_id"}, 404
+	
+	queue: asyncio.Queue = job["queue"]
+	
+	# Try to get an event from the queue (non-blocking)
+	try:
+		# Use run_coroutine_threadsafe with a short timeout
+		event = asyncio.run_coroutine_threadsafe(queue.get(), _loop).result(timeout=0.1)
+		return event, 200
+	except asyncio.TimeoutError:
+		# No event available yet, return empty response
+		return {"status": "waiting"}, 200
+	except Exception as e:
+		return {"error": str(e)}, 500
+
+@app.post("/confirm/<job_id>")
+def http_confirm_download(job_id: str):
+	"""HTTP endpoint for confirming download (for clients without WebSocket)"""
+	job = _jobs.get(job_id)
+	if not job:
+		return {"error": "unknown job_id"}, 404
+	
+	confirmation_event = job.get("confirmation")
+	if confirmation_event:
+		job["confirmed"] = True
+		# Signal the confirmation event in the event loop
+		asyncio.run_coroutine_threadsafe(confirmation_event.set(), _loop)
+		print(f"[HTTP] Download confirmed for job: {job_id}", flush=True)
+		return {"status": "confirmed"}, 200
+	else:
+		return {"error": "no confirmation event for this job"}, 400
+
 @socketio.on("connect")
 def on_connect():
 	print(f"[WS] New WebSocket connection", flush=True)
