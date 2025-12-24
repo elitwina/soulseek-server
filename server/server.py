@@ -21,7 +21,8 @@ app = Flask(__name__)
 # It will prefer eventlet, then gevent, then threading
 # For production with gunicorn, we can use eventlet or gevent
 # If SOCKETIO_ASYNC_MODE is not set, Flask-SocketIO will auto-detect
-async_mode = os.environ.get("SOCKETIO_ASYNC_MODE")  # None = auto-detect (prefers eventlet, then gevent)
+# For development, use threading to avoid output buffering issues with eventlet
+async_mode = os.environ.get("SOCKETIO_ASYNC_MODE", "threading")  # Default to threading for development
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode=async_mode)
 
 # Configure credentials and paths
@@ -78,12 +79,15 @@ _job_sids: Dict[str, str] = {}
 
 @app.post("/download")
 def http_start_download():
+	print(f"[HTTP] POST /download received", flush=True)
 	data = request.get_json(force=True) if request.data else {}
 	query = (data.get("query") or "").strip()
+	print(f"[HTTP] Query: {query}", flush=True)
 	if not query:
 		return {"error": "missing query"}, 400
 
 	job_id = os.urandom(6).hex()
+	print(f"[HTTP] Created job_id: {job_id}", flush=True)
 	queue: asyncio.Queue = asyncio.Queue(maxsize=100)
 	confirmation_event = asyncio.Event()
 	_jobs[job_id] = {
@@ -103,10 +107,10 @@ def http_start_download():
 
 	async def run_job():
 		format_msg = f" (preferred: {preferred_format})" if preferred_format else ""
-		print(f"[JOB {job_id}] Starting download for: {query}{format_msg}")
+		print(f"[JOB {job_id}] Starting download for: {query}{format_msg}", flush=True)
 		try:
 			async for ev in svc.download(query, preferred_format=preferred_format if preferred_format else None, confirmation_event=confirmation_event):
-				print(f"[JOB {job_id}] Event received: {ev.kind} - {ev.message}")
+				print(f"[JOB {job_id}] Event received: {ev.kind} - {ev.message}", flush=True)
 				# Track path/finished for streaming
 				if ev.kind == "started" and ev.path:
 					_jobs[job_id]["path"] = ev.path
@@ -128,7 +132,7 @@ def http_start_download():
 
 	task = asyncio.run_coroutine_threadsafe(run_job(), _loop)
 	_jobs[job_id]["task"] = task
-	print(f"[JOB {job_id}] Task submitted to event loop")
+	print(f"[JOB {job_id}] Task submitted to event loop", flush=True)
 	# Check if task started successfully
 	try:
 		task.result(timeout=0.1)
@@ -140,39 +144,52 @@ def http_start_download():
 
 @socketio.on("connect")
 def on_connect():
-	print(f"[WS] New WebSocket connection")
+	print(f"[WS] New WebSocket connection", flush=True)
 
 @socketio.on("subscribe")
 def on_subscribe(data):
 	job_id = data.get("job_id")
 	sid = request.sid
-	print(f"[WS] Subscribe request for job: {job_id} from sid: {sid}")
+	print(f"[WS] Subscribe request for job: {job_id} from sid: {sid}", flush=True)
 	if not job_id or job_id not in _jobs:
+		print(f"[WS] ERROR: Job {job_id} not found in _jobs", flush=True)
 		emit("error", {"kind": "error", "message": "unknown job_id"})
 		return
 	
 	_job_sids[job_id] = sid
-	print(f"[WS] Connected to job: {job_id}")
+	print(f"[WS] Connected to job: {job_id}", flush=True)
 	queue: asyncio.Queue = _jobs[job_id]["queue"]
 	
 	# Start background task to drain queue
 	def send_events():
-		print(f"[WS] Background task started for job {job_id}")
-		while True:
+		print(f"[WS] Background task started for job {job_id}", flush=True)
+		job_finished = False
+		while not job_finished:
 			try:
-				print(f"[WS] Waiting for queue item...")
+				print(f"[WS] Waiting for queue item...", flush=True)
 				item = asyncio.run_coroutine_threadsafe(queue.get(), _loop).result(timeout=60)
-				print(f"[WS] Got item from queue: {item.get('kind')}")
+				print(f"[WS] Got item from queue: {item.get('kind')}", flush=True)
 				socketio.emit("progress", item, room=sid)
-				print(f"[WS] Sent event: {item.get('kind')}")
-				if item.get("kind") == "finished":
-					print(f"[WS] Job finished, stopping background task")
+				print(f"[WS] Sent event: {item.get('kind')}", flush=True)
+				if item.get("kind") == "finished" or item.get("kind") == "error":
+					print(f"[WS] Job finished/error, stopping background task")
+					job_finished = True
 					break
+			except TimeoutError:
+				# Timeout is normal - just check if job is still active
+				if job_id not in _jobs or _jobs[job_id].get("finished", False):
+					print(f"[WS] Job finished, stopping background task")
+					job_finished = True
+					break
+				# Continue waiting for more events
+				continue
 			except Exception as e:
 				print(f"[WS] Error in loop: {e}")
 				import traceback
 				traceback.print_exc()
-				break
+				# Only break on unexpected errors, not timeouts
+				if "TimeoutError" not in str(type(e).__name__):
+					break
 	
 	socketio.start_background_task(send_events)
 
@@ -180,8 +197,10 @@ def on_subscribe(data):
 def on_confirm_download(data):
 	job_id = data.get("job_id")
 	sid = request.sid
-	print(f"[WS] Confirm download request for job: {job_id} from sid: {sid}")
+	print(f"[WS] Confirm download request received for job: {job_id} from sid: {sid}")
+	print(f"[WS] Data received: {data}")
 	if not job_id or job_id not in _jobs:
+		print(f"[WS] ERROR: Unknown job_id: {job_id}")
 		emit("error", {"kind": "error", "message": "unknown job_id"})
 		return
 	
@@ -190,10 +209,12 @@ def on_confirm_download(data):
 	if confirmation_event:
 		job["confirmed"] = True
 		# Signal the confirmation event in the event loop
+		print(f"[WS] Setting confirmation event for job: {job_id}")
 		asyncio.run_coroutine_threadsafe(confirmation_event.set(), _loop)
 		print(f"[WS] Download confirmed for job: {job_id}")
 		emit("progress", {"kind": "status", "message": "Download confirmed, starting..."}, room=sid)
 	else:
+		print(f"[WS] ERROR: No confirmation event for job: {job_id}")
 		emit("error", {"kind": "error", "message": "no confirmation event for this job"})
 
 @app.get("/stream/<job_id>")
@@ -263,8 +284,22 @@ def http_stream_file(job_id: str):
 
 if __name__ == "__main__":
 	# Development mode - use Flask dev server
+	import sys
+	sys.stdout.flush()  # Ensure output is not buffered
 	port = int(os.environ.get("PORT", 8001))
-	socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
+	print(f"[SERVER] Starting server on port {port}...", flush=True)
+	print(f"[SERVER] SocketIO async_mode: {socketio.async_mode}", flush=True)
+	print(f"[SERVER] Download directory: {DOWNLOAD_DIR}", flush=True)
+	print(f"[SERVER] Server will be available at http://0.0.0.0:{port}", flush=True)
+	print(f"[SERVER] Press CTRL+C to stop", flush=True)
+	try:
+		socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
+	except KeyboardInterrupt:
+		print("\n[SERVER] Shutting down...", flush=True)
+	except Exception as e:
+		print(f"[SERVER] Error starting server: {e}", flush=True)
+		import traceback
+		traceback.print_exc()
 else:
 	# Production mode - gunicorn will import this module
 	# The app and socketio objects are already created above
