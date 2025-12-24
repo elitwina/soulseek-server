@@ -17,7 +17,9 @@ logging.getLogger('aioslsk.network').setLevel(logging.WARNING)
 logging.getLogger('aioslsk.transfer').setLevel(logging.WARNING)
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+# Use gevent async mode for production with gunicorn, threading for development
+async_mode = os.environ.get("SOCKETIO_ASYNC_MODE", "gevent")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=async_mode)
 
 # Configure credentials and paths
 USERNAME = "DjLic"
@@ -257,6 +259,11 @@ def http_stream_file(job_id: str):
 	return Response(stream_with_context(generate()), mimetype="application/octet-stream")
 
 if __name__ == "__main__":
+	# Development mode - use Flask dev server
 	port = int(os.environ.get("PORT", 8001))
 	socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
+else:
+	# Production mode - gunicorn will import this module
+	# The app and socketio objects are already created above
+	pass
 
