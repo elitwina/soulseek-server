@@ -332,7 +332,7 @@ class SoulseekService:
 						except asyncio.TimeoutError:
 							yield DownloadEvent(kind="error", message="Confirmation timeout")
 							return
-					
+
 					# Track users that have already failed to avoid retrying them
 					failed_users = set()
 					
@@ -433,7 +433,21 @@ class SoulseekService:
 						client.events.register(TransferRemovedEvent, on_removed_t)
 						client.events.register(TransferProgressEvent, on_progress_t)
 
-						transfer = await client.transfers.download(username, filename)
+						try:
+							transfer = await client.transfers.download(username, filename)
+						except Exception as download_error:
+							# Catch peer connection errors during download initiation
+							error_str = str(download_error)
+							error_type = type(download_error).__name__
+							if 'PeerConnectionError' in error_type or 'peer' in error_str.lower() or 'connection' in error_str.lower():
+								client.events.unregister(TransferRemovedEvent, on_removed_t)
+								client.events.unregister(TransferProgressEvent, on_progress_t)
+								failed_users.add(username)
+								yield DownloadEvent(kind="status", message=f"Connection failed to {username}, trying next")
+								continue
+							else:
+								# Re-raise unexpected errors
+								raise
 						
 						# Track if we detected queued state
 						queued_and_stuck = asyncio.Event()

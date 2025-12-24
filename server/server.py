@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import time
 from threading import Thread
@@ -9,6 +10,11 @@ from flask import Flask, request, Response, stream_with_context
 from flask_socketio import SocketIO, emit
 
 from slsk_service import SoulseekService, DownloadEvent
+
+# Configure logging to suppress verbose aioslsk peer connection errors
+logging.getLogger('aioslsk').setLevel(logging.WARNING)
+logging.getLogger('aioslsk.network').setLevel(logging.WARNING)
+logging.getLogger('aioslsk.transfer').setLevel(logging.WARNING)
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -23,8 +29,38 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # Run an event loop in a background thread for aioslsk
 _loop = asyncio.new_event_loop()
 
+def _handle_exception(loop, context):
+	"""Handle unhandled exceptions in the event loop, especially from aioslsk background tasks."""
+	exception = context.get('exception')
+	message = context.get('message', '')
+	
+	# Filter out expected peer connection errors that are normal during downloads
+	if exception:
+		exception_type = type(exception).__name__
+		exception_str = str(exception)
+		
+		# These are expected network errors during peer connection attempts
+		if 'PeerConnectionError' in exception_type or 'PeerConnectionError' in exception_str:
+			# Only log at debug level, these are expected
+			if 'indirect connection' in exception_str or 'failed connect' in exception_str:
+				# These are normal - peer might be behind NAT/firewall
+				return
+		
+		# Log other unexpected exceptions
+		print(f"[EVENT_LOOP] Unhandled exception: {exception_type}: {exception_str}")
+		if 'Task exception was never retrieved' not in message:
+			print(f"[EVENT_LOOP] Context: {message}")
+	else:
+		# Log non-exception context messages
+		if 'Task exception was never retrieved' in message:
+			# This is usually from aioslsk background tasks, can be ignored
+			return
+		print(f"[EVENT_LOOP] {message}")
+
 def _run_loop(loop):
 	asyncio.set_event_loop(loop)
+	# Set exception handler to catch unhandled exceptions from background tasks
+	loop.set_exception_handler(_handle_exception)
 	loop.run_forever()
 
 _thread = Thread(target=_run_loop, args=(_loop,), daemon=True)
