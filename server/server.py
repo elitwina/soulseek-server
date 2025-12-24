@@ -168,8 +168,11 @@ def http_poll_job(job_id: str):
 @app.post("/confirm/<job_id>")
 def http_confirm_download(job_id: str):
 	"""HTTP endpoint for confirming download (for clients without WebSocket)"""
+	print(f"[HTTP CONFIRM] POST /confirm/{job_id} received", flush=True)
+	print(f"[HTTP CONFIRM] Available jobs: {list(_jobs.keys())}", flush=True)
 	job = _jobs.get(job_id)
 	if not job:
+		print(f"[HTTP CONFIRM] Job {job_id} not found", flush=True)
 		return {"error": "unknown job_id"}, 404
 	
 	confirmation_event = job.get("confirmation")
@@ -177,9 +180,10 @@ def http_confirm_download(job_id: str):
 		job["confirmed"] = True
 		# Signal the confirmation event in the event loop
 		asyncio.run_coroutine_threadsafe(confirmation_event.set(), _loop)
-		print(f"[HTTP] Download confirmed for job: {job_id}", flush=True)
+		print(f"[HTTP CONFIRM] Download confirmed for job: {job_id}", flush=True)
 		return {"status": "confirmed"}, 200
 	else:
+		print(f"[HTTP CONFIRM] No confirmation event for job: {job_id}", flush=True)
 		return {"error": "no confirmation event for this job"}, 400
 
 @socketio.on("connect")
