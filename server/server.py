@@ -156,13 +156,23 @@ def http_poll_job(job_id: str):
 	
 	# Try to get an event from the queue (non-blocking)
 	try:
-		# Use run_coroutine_threadsafe with a short timeout
-		event = asyncio.run_coroutine_threadsafe(queue.get(), _loop).result(timeout=0.1)
+		# Check if queue is not empty first
+		if queue.empty():
+			print(f"[HTTP POLL] Queue is empty, returning waiting status", flush=True)
+			return {"status": "waiting"}, 200
+		
+		# Use run_coroutine_threadsafe with a longer timeout to get the event
+		event = asyncio.run_coroutine_threadsafe(queue.get(), _loop).result(timeout=0.5)
+		print(f"[HTTP POLL] Returning event: {event.get('kind') if isinstance(event, dict) else 'unknown'}", flush=True)
 		return event, 200
 	except asyncio.TimeoutError:
 		# No event available yet, return empty response
+		print(f"[HTTP POLL] Timeout getting event, returning waiting status", flush=True)
 		return {"status": "waiting"}, 200
 	except Exception as e:
+		print(f"[HTTP POLL] Error getting event: {e}", flush=True)
+		import traceback
+		print(f"[HTTP POLL] Traceback: {traceback.format_exc()}", flush=True)
 		return {"error": str(e)}, 500
 
 @app.post("/confirm/<job_id>")
