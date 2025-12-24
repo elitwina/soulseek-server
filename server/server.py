@@ -89,10 +89,12 @@ def http_start_download():
 	job_id = os.urandom(6).hex()
 	print(f"[HTTP] Created job_id: {job_id}", flush=True)
 	queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+	http_polling_events = []  # Separate list for HTTP polling clients
 	confirmation_event = asyncio.Event()
 	_jobs[job_id] = {
 		"query": query,
 		"queue": queue,
+		"http_polling_events": http_polling_events,
 		"path": None,
 		"finished": False,
 		"confirmation": confirmation_event,
@@ -116,9 +118,12 @@ def http_start_download():
 					_jobs[job_id]["path"] = ev.path
 				elif ev.kind == "finished":
 					_jobs[job_id]["finished"] = True
-				# Enqueue for WS consumers
+				# Enqueue for WS consumers and HTTP polling
 				try:
-					await queue.put(ev.__dict__)
+					event_dict = ev.__dict__
+					await queue.put(event_dict)
+					# Also add to HTTP polling events list (thread-safe append)
+					_jobs[job_id]["http_polling_events"].append(event_dict)
 					print(f"[JOB {job_id}] Event enqueued: {ev.kind}")
 				except asyncio.CancelledError:
 					print(f"[JOB {job_id}] Cancelled")
@@ -152,25 +157,18 @@ def http_poll_job(job_id: str):
 		print(f"[HTTP POLL] Job {job_id} not found", flush=True)
 		return {"error": "unknown job_id"}, 404
 	
-	queue: asyncio.Queue = job["queue"]
+	http_polling_events = job.get("http_polling_events", [])
 	
-	# Try to get an event from the queue (non-blocking)
-	# Use a longer timeout to ensure we can get events that are already in the queue
-	try:
-		# Use run_coroutine_threadsafe with a longer timeout to get the event
-		event = asyncio.run_coroutine_threadsafe(queue.get(), _loop).result(timeout=0.5)
+	# Get the next event from HTTP polling events list (FIFO)
+	if http_polling_events:
+		event = http_polling_events.pop(0)  # Remove and return first event
 		event_kind = event.get('kind') if isinstance(event, dict) else 'unknown'
-		print(f"[HTTP POLL] Returning event: {event_kind}", flush=True)
+		print(f"[HTTP POLL] Returning event: {event_kind} (remaining: {len(http_polling_events)})", flush=True)
 		return event, 200
-	except asyncio.TimeoutError:
-		# No event available yet, return empty response
-		print(f"[HTTP POLL] Timeout getting event (queue may be empty), returning waiting status", flush=True)
+	else:
+		# No events available yet
+		print(f"[HTTP POLL] No events available, returning waiting status", flush=True)
 		return {"status": "waiting"}, 200
-	except Exception as e:
-		print(f"[HTTP POLL] Error getting event: {e}", flush=True)
-		import traceback
-		print(f"[HTTP POLL] Traceback: {traceback.format_exc()}", flush=True)
-		return {"error": str(e)}, 500
 
 @app.post("/confirm/<job_id>")
 def http_confirm_download(job_id: str):
