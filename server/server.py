@@ -106,7 +106,16 @@ def http_start_download():
 	if preferred_format and preferred_format not in ("mp3", "flac"):
 		preferred_format = None
 	
-	svc = SoulseekService(USERNAME, PASSWORD, DOWNLOAD_DIR, search_timeout=5)
+	# Get search_timeout from request (default: 10 seconds)
+	search_timeout = data.get("search_timeout", 10)
+	try:
+		search_timeout = int(search_timeout)
+		if search_timeout < 1 or search_timeout > 60:
+			search_timeout = 10  # Clamp to reasonable range
+	except (ValueError, TypeError):
+		search_timeout = 10  # Default if invalid
+	
+	svc = SoulseekService(USERNAME, PASSWORD, DOWNLOAD_DIR, search_timeout=search_timeout)
 
 	async def run_job():
 		format_msg = f" (preferred: {preferred_format})" if preferred_format else ""
