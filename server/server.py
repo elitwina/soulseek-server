@@ -17,8 +17,11 @@ logging.getLogger('aioslsk.network').setLevel(logging.WARNING)
 logging.getLogger('aioslsk.transfer').setLevel(logging.WARNING)
 
 app = Flask(__name__)
-# Use gevent async mode for production with gunicorn, threading for development
-async_mode = os.environ.get("SOCKETIO_ASYNC_MODE", "gevent")
+# Let Flask-SocketIO auto-detect the best async mode
+# It will prefer eventlet, then gevent, then threading
+# For production with gunicorn, we can use eventlet or gevent
+# If SOCKETIO_ASYNC_MODE is not set, Flask-SocketIO will auto-detect
+async_mode = os.environ.get("SOCKETIO_ASYNC_MODE")  # None = auto-detect (prefers eventlet, then gevent)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode=async_mode)
 
 # Configure credentials and paths

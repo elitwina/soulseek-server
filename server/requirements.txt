@@ -5,6 +5,7 @@ python-socketio
 gunicorn
 gevent
 gevent-websocket
+eventlet
 
 
 
