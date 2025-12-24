@@ -97,6 +97,7 @@ def http_start_download():
 		"http_polling_events": http_polling_events,
 		"path": None,
 		"finished": False,
+		"cancelled": False,
 		"confirmation": confirmation_event,
 		"confirmed": False,
 	}
@@ -112,6 +113,11 @@ def http_start_download():
 		print(f"[JOB {job_id}] Starting download for: {query}{format_msg}", flush=True)
 		try:
 			async for ev in svc.download(query, preferred_format=preferred_format if preferred_format else None, confirmation_event=confirmation_event):
+				# Check if job was cancelled
+				if _jobs.get(job_id, {}).get("cancelled", False):
+					print(f"[JOB {job_id}] Job was cancelled, stopping", flush=True)
+					break
+				
 				print(f"[JOB {job_id}] Event received: {ev.kind} - {ev.message}", flush=True)
 				# Track path/finished for streaming
 				if ev.kind == "started" and ev.path:
@@ -129,11 +135,14 @@ def http_start_download():
 					print(f"[JOB {job_id}] Cancelled")
 					break
 			print(f"[JOB {job_id}] Download job completed")
+		except asyncio.CancelledError:
+			print(f"[JOB {job_id}] Task cancelled", flush=True)
 		except Exception as e:
 			print(f"[JOB {job_id}] ERROR in run_job: {e}")
 			import traceback
 			traceback.print_exc()
-			await queue.put({"kind": "error", "message": str(e)})
+			if not _jobs.get(job_id, {}).get("cancelled", False):
+				await queue.put({"kind": "error", "message": str(e)})
 
 	task = asyncio.run_coroutine_threadsafe(run_job(), _loop)
 	_jobs[job_id]["task"] = task
@@ -191,9 +200,106 @@ def http_confirm_download(job_id: str):
 		print(f"[HTTP CONFIRM] No confirmation event for job: {job_id}", flush=True)
 		return {"error": "no confirmation event for this job"}, 400
 
+@app.post("/stop/<job_id>")
+def http_stop_download(job_id: str):
+	"""HTTP endpoint for stopping/cancelling a download"""
+	print(f"[HTTP STOP] POST /stop/{job_id} received", flush=True)
+	job = _jobs.get(job_id)
+	if not job:
+		print(f"[HTTP STOP] Job {job_id} not found", flush=True)
+		return {"error": "unknown job_id"}, 404
+	
+	# Mark job as cancelled
+	job["cancelled"] = True
+	job["finished"] = True
+	
+	# Cancel the task if it exists
+	task = job.get("task")
+	if task:
+		try:
+			task.cancel()
+			print(f"[HTTP STOP] Task cancelled for job: {job_id}", flush=True)
+		except Exception as e:
+			print(f"[HTTP STOP] Error cancelling task: {e}", flush=True)
+	
+	# Delete the temporary file if it exists
+	file_path = job.get("path")
+	if file_path and os.path.exists(file_path):
+		try:
+			os.remove(file_path)
+			print(f"[HTTP STOP] Deleted file: {file_path}", flush=True)
+		except Exception as e:
+			print(f"[HTTP STOP] Error deleting file: {e}", flush=True)
+	
+	# Send cancellation event to clients
+	cancellation_event = {"kind": "cancelled", "message": "Download cancelled by user"}
+	queue = job.get("queue")
+	if queue:
+		try:
+			asyncio.run_coroutine_threadsafe(queue.put(cancellation_event), _loop)
+		except Exception as e:
+			print(f"[HTTP STOP] Error sending cancellation event: {e}", flush=True)
+	
+	# Add to HTTP polling events
+	http_polling_events = job.get("http_polling_events", [])
+	http_polling_events.append(cancellation_event)
+	
+	print(f"[HTTP STOP] Download stopped for job: {job_id}", flush=True)
+	return {"status": "stopped"}, 200
+
 @socketio.on("connect")
 def on_connect():
 	print(f"[WS] New WebSocket connection", flush=True)
+
+@socketio.on("stop_download")
+def on_stop_download(data):
+	"""WebSocket event to stop a download"""
+	job_id = data.get("job_id")
+	sid = request.sid
+	print(f"[WS] Stop download request for job: {job_id} from sid: {sid}", flush=True)
+	
+	if not job_id or job_id not in _jobs:
+		print(f"[WS] ERROR: Job {job_id} not found in _jobs", flush=True)
+		emit("error", {"kind": "error", "message": "unknown job_id"})
+		return
+	
+	job = _jobs[job_id]
+	job["cancelled"] = True
+	job["finished"] = True
+	
+	# Cancel the task if it exists
+	task = job.get("task")
+	if task:
+		try:
+			task.cancel()
+			print(f"[WS] Task cancelled for job: {job_id}", flush=True)
+		except Exception as e:
+			print(f"[WS] Error cancelling task: {e}", flush=True)
+	
+	# Delete the temporary file if it exists
+	file_path = job.get("path")
+	if file_path and os.path.exists(file_path):
+		try:
+			os.remove(file_path)
+			print(f"[WS] Deleted file: {file_path}", flush=True)
+		except Exception as e:
+			print(f"[WS] Error deleting file: {e}", flush=True)
+	
+	# Send cancellation event
+	cancellation_event = {"kind": "cancelled", "message": "Download cancelled by user"}
+	queue = job.get("queue")
+	if queue:
+		try:
+			asyncio.run_coroutine_threadsafe(queue.put(cancellation_event), _loop)
+		except Exception as e:
+			print(f"[WS] Error sending cancellation event: {e}", flush=True)
+	
+	# Add to HTTP polling events
+	http_polling_events = job.get("http_polling_events", [])
+	http_polling_events.append(cancellation_event)
+	
+	emit("progress", cancellation_event, room=sid)
+	print(f"[WS] Download stopped for job: {job_id}", flush=True)
 
 @socketio.on("subscribe")
 def on_subscribe(data):
