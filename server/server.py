@@ -193,27 +193,21 @@ def http_confirm_download(job_id: str):
 	if confirmation_event:
 		job["confirmed"] = True
 		# Signal the confirmation event in the event loop
+		# confirmation_event.set() is not a coroutine, it's a regular method
+		# We need to call it in the event loop thread
 		try:
-			asyncio.run_coroutine_threadsafe(confirmation_event.set(), _loop)
+			# Create a coroutine that calls set()
+			async def set_event():
+				confirmation_event.set()
+			
+			asyncio.run_coroutine_threadsafe(set_event(), _loop)
 			print(f"[HTTP CONFIRM] Download confirmed for job: {job_id}", flush=True)
 			return {"status": "confirmed"}, 200
 		except Exception as e:
 			print(f"[HTTP CONFIRM] Error setting confirmation event: {e}", flush=True)
 			import traceback
 			print(f"[HTTP CONFIRM] Traceback: {traceback.format_exc()}", flush=True)
-			# Try to set it directly if it's an Event
-			try:
-				if hasattr(confirmation_event, 'set'):
-					# If it's already set, that's fine
-					if not confirmation_event.is_set():
-						# Try to set it in the event loop with a different approach
-						future = asyncio.run_coroutine_threadsafe(confirmation_event.set(), _loop)
-						future.result(timeout=1.0)
-					print(f"[HTTP CONFIRM] Download confirmed for job: {job_id} (retry)", flush=True)
-					return {"status": "confirmed"}, 200
-			except Exception as e2:
-				print(f"[HTTP CONFIRM] Retry also failed: {e2}", flush=True)
-				return {"error": f"Failed to confirm: {str(e2)}"}, 500
+			return {"error": f"Failed to confirm: {str(e)}"}, 500
 	else:
 		print(f"[HTTP CONFIRM] No confirmation event for job: {job_id}", flush=True)
 		return {"error": "no confirmation event for this job"}, 400
