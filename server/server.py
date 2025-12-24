@@ -105,7 +105,7 @@ def http_start_download():
 	if preferred_format and preferred_format not in ("mp3", "flac"):
 		preferred_format = None
 	
-	svc = SoulseekService(USERNAME, PASSWORD, DOWNLOAD_DIR, search_timeout=10)
+	svc = SoulseekService(USERNAME, PASSWORD, DOWNLOAD_DIR, search_timeout=5)
 
 	async def run_job():
 		format_msg = f" (preferred: {preferred_format})" if preferred_format else ""
