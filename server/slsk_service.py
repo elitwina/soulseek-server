@@ -377,9 +377,20 @@ class SoulseekService:
 							candidates = fallback or filtered
 							yield DownloadEvent(kind="status", message=f"no HQ found; using {len(candidates)} filtered candidates")
 
+					# Prepare fallback candidates (all filtered files, not just high-quality)
+					# If high-quality candidates fail, we'll try the rest
+					fallback_candidates = []
+					if hq and candidates == hq:
+						# If we're using only high-quality, prepare fallback from filtered
+						fallback_candidates = [x for x in filtered if x not in hq]
+						if fallback_candidates:
+							print(f"[SEARCH] 🔄 Prepared {len(fallback_candidates)} fallback candidate(s) in case high-quality fails")
+					
 					# Send list of candidate file names to client for existence check
-					candidate_filenames = [x[1] for x in candidates]  # Extract just the filenames
-					print(f"[SEARCH] 📋 Sending {len(candidate_filenames)} candidate file(s) to client for verification")
+					# Include both primary candidates and fallback candidates
+					all_candidates_for_client = candidates + fallback_candidates
+					candidate_filenames = [x[1] for x in all_candidates_for_client]  # Extract just the filenames
+					print(f"[SEARCH] 📋 Sending {len(candidate_filenames)} candidate file(s) to client for verification ({len(candidates)} primary, {len(fallback_candidates)} fallback)")
 					yield DownloadEvent(kind="files_list", files_list=candidate_filenames, message=f"Found {len(candidate_filenames)} candidate files")
 					
 					# Wait for client confirmation before starting download
@@ -397,14 +408,19 @@ class SoulseekService:
 					# Track users that have already failed to avoid retrying them
 					failed_users = set()
 					
+					# Combine primary candidates with fallback candidates
+					all_candidates_to_try = candidates + fallback_candidates
+					
 					# Check if all candidates are from the same user
-					unique_users_in_candidates = set(x[0] for x in candidates)
+					unique_users_in_candidates = set(x[0] for x in all_candidates_to_try)
 					if len(unique_users_in_candidates) == 1:
 						only_user = list(unique_users_in_candidates)[0]
-						yield DownloadEvent(kind="status", message=f"Warning: All {len(candidates)} candidates are from the same user ({only_user}). If this user fails, no alternatives available.")
+						yield DownloadEvent(kind="status", message=f"Warning: All {len(all_candidates_to_try)} candidates are from the same user ({only_user}). If this user fails, no alternatives available.")
+					else:
+						print(f"[SEARCH] ✅ Have candidates from {len(unique_users_in_candidates)} unique user(s) to try")
 					
 					candidates_tried = 0
-					for idx, (username, filename, size, ext, sim) in enumerate(candidates, 1):
+					for idx, (username, filename, size, ext, sim) in enumerate(all_candidates_to_try, 1):
 						# Skip users that have already failed
 						if username in failed_users:
 							yield DownloadEvent(kind="status", message=f"candidate #{idx}: {username} | {ext} | {size} (skipping - already failed)")
@@ -582,6 +598,7 @@ class SoulseekService:
 					
 					# If we've tried all candidates and all failed
 					if candidates_tried > 0 and len(failed_users) >= len(unique_users_in_candidates) and not finished_success:
+						print(f"[SEARCH] ❌ All {len(unique_users_in_candidates)} unique user(s) failed. Tried {candidates_tried} candidate(s) out of {len(all_candidates_to_try)} total candidates.")
 						yield DownloadEvent(kind="error", message=f"All {len(unique_users_in_candidates)} unique user(s) failed. Tried {candidates_tried} candidate(s) total. No more options available from search results.")
 						return
 				break  # Successfully connected and completed
