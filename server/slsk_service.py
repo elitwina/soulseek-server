@@ -173,10 +173,22 @@ class SoulseekService:
 		max_retries = 3
 		for attempt in range(max_retries):
 			try:
+				print(f"[SEARCH] 🔌 Connecting to Soulseek (attempt {attempt + 1}/{max_retries})...")
 				async with SoulSeekClient(settings=settings) as client:
+					print(f"[SEARCH] 🔐 Logging in to Soulseek...")
 					await client.login()
+					print(f"[SEARCH] ✅ Successfully logged in to Soulseek")
+
+					search_request_id = None
+					search_started = False
 
 					async def on_result(event: SearchResultEvent):
+						nonlocal search_started
+						if not search_started:
+							search_started = True
+							print(f"[SEARCH] 📡 Search request active, receiving results...")
+						
+						result_count = 0
 						for file in list(event.result.shared_items) + list(event.result.locked_results):
 							ext = (file.extension or os.path.splitext(file.filename)[1][1:]).lower()
 							if ext not in ALLOWED_EXTS:
@@ -185,22 +197,56 @@ class SoulseekService:
 							if fsize < MIN_SIZE_BYTES:
 								continue
 							collected.append((event.result.username, file.filename, fsize, ext))
+							result_count += 1
+						
+						if result_count > 0:
+							print(f"[SEARCH] 📥 Received {result_count} file(s) from user '{event.result.username}' (total collected: {len(collected)})")
 
 					async def on_removed(event: SearchRequestRemovedEvent):
+						nonlocal search_request_id
+						# Check if this is our search request
+						if search_request_id and event.request_id == search_request_id:
+							print(f"[SEARCH] ⚠️  Search request was removed by server (request_id: {search_request_id})")
+							print(f"[SEARCH] ⚠️  This usually means: session expired, timeout, or server closed the search")
+							if not collected:
+								print(f"[SEARCH] ❌ No results collected before search was removed")
+							else:
+								print(f"[SEARCH] ✅ Collected {len(collected)} results before search was removed")
 						stop_event.set()
 
 					client.events.register(SearchResultEvent, on_result)
 					client.events.register(SearchRequestRemovedEvent, on_removed)
 
-					_ = await client.searches.search(query)
+					print(f"[SEARCH] 🔍 Sending search request for: '{query}' (timeout: {self.search_timeout}s)")
+					search_request = await client.searches.search(query)
+					search_request_id = search_request.request_id if hasattr(search_request, 'request_id') else None
+					print(f"[SEARCH] ✅ Search request sent (request_id: {search_request_id})")
+					
 					await event_queue.put(DownloadEvent(kind="status", message=f"searching '{query}' ({self.search_timeout}s)"))
+					
 					# Yield events in real-time while waiting for search to end
+					search_timeout_reached = False
+					search_start_time = asyncio.get_event_loop().time()
 					while not stop_event.is_set():
 						try:
 							ev = await asyncio.wait_for(event_queue.get(), timeout=0.2)
 							yield ev
 						except asyncio.TimeoutError:
+							# Check if search timeout was reached
+							elapsed = asyncio.get_event_loop().time() - search_start_time
+							if elapsed >= self.search_timeout and not search_timeout_reached:
+								search_timeout_reached = True
+								print(f"[SEARCH] ⏱️  Search timeout reached ({self.search_timeout}s), stopping search")
+								# Try to remove the search request if possible
+								if search_request_id:
+									try:
+										await client.searches.remove(search_request_id)
+										print(f"[SEARCH] 🗑️  Removed search request {search_request_id}")
+									except Exception as e:
+										print(f"[SEARCH] ⚠️  Could not remove search request: {e}")
+								stop_event.set()
 							pass
+					
 					# Drain remaining queued events
 					while not event_queue.empty():
 						ev = await event_queue.get()
@@ -210,14 +256,17 @@ class SoulseekService:
 					client.events.unregister(SearchRequestRemovedEvent, on_removed)
 
 					if not collected:
+						print(f"[SEARCH] ❌ No results found for: '{query}'")
 						yield DownloadEvent(kind="error", message="no results")
 						return
 
 					# Log how many results we collected
 					unique_users_collected = len(set(x[0] for x in collected))
+					print(f"[SEARCH] ✅ Search completed: Found {len(collected)} file(s) from {unique_users_collected} unique user(s)")
 					yield DownloadEvent(kind="status", message=f"Collected {len(collected)} files from {unique_users_collected} unique user(s)")
 
 					target = _basename_without_ext(query)
+					print(f"[SEARCH] 🔍 Calculating similarity scores for {len(collected)} files...")
 					with_scores = [(
 						username,
 						filename,
@@ -230,15 +279,21 @@ class SoulseekService:
 					if with_scores:
 						max_sim = max(x[4] for x in with_scores)
 						min_sim = min(x[4] for x in with_scores)
+						print(f"[SEARCH] 📊 Similarity range: {min_sim:.2f} - {max_sim:.2f}")
 						yield DownloadEvent(kind="status", message=f"Similarity range: {min_sim:.2f} - {max_sim:.2f}")
 					
 					max_sim = max(x[4] for x in with_scores) if with_scores else 0
 					# Be more lenient with similarity - use 0.30 to include more results (handles underscores, hyphens, etc.)
-					filtered = [x for x in with_scores if x[4] >= max_sim - 0.30]
+					similarity_threshold = max_sim - 0.30
+					print(f"[SEARCH] 🎯 Filtering results (similarity threshold: {similarity_threshold:.2f})...")
+					filtered = [x for x in with_scores if x[4] >= similarity_threshold]
+					print(f"[SEARCH] ✅ After similarity filtering: {len(filtered)} file(s) remaining (from {len(with_scores)} total)")
+					
 					filtered.sort(key=lambda x: _quality_tuple(x[1], x[2], x[3], x[4], preferred_format))
 					filtered = list(reversed(filtered))
 
 					# Deduplicate by username: keep only the best candidate per user
+					print(f"[SEARCH] 🔄 Deduplicating by username...")
 					seen_users = set()
 					dedup = []
 					for x in filtered:
@@ -256,9 +311,12 @@ class SoulseekService:
 							if len(dedup) >= 5:
 								break
 					filtered = dedup
+					print(f"[SEARCH] ✅ After deduplication: {len(filtered)} unique file(s) from {len(seen_users)} user(s)")
 
 					# Apply high-quality gate for initial selection
+					print(f"[SEARCH] 🎚️  Applying quality filter...")
 					hq = [x for x in filtered if _is_high_quality(x[1], x[2], x[3], x[4])]
+					print(f"[SEARCH] ✅ High-quality files: {len(hq)} out of {len(filtered)}")
 					if hq:
 						# If preferred_format is mp3, prioritize MP3 320 from HQ candidates
 						if preferred_format and preferred_format.lower() == "mp3":
@@ -321,6 +379,7 @@ class SoulseekService:
 
 					# Send list of candidate file names to client for existence check
 					candidate_filenames = [x[1] for x in candidates]  # Extract just the filenames
+					print(f"[SEARCH] 📋 Sending {len(candidate_filenames)} candidate file(s) to client for verification")
 					yield DownloadEvent(kind="files_list", files_list=candidate_filenames, message=f"Found {len(candidate_filenames)} candidate files")
 					
 					# Wait for client confirmation before starting download

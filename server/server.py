@@ -79,15 +79,13 @@ _job_sids: Dict[str, str] = {}
 
 @app.post("/download")
 def http_start_download():
-	print(f"[HTTP] POST /download received", flush=True)
 	data = request.get_json(force=True) if request.data else {}
 	query = (data.get("query") or "").strip()
-	print(f"[HTTP] Query: {query}", flush=True)
 	if not query:
 		return {"error": "missing query"}, 400
 
 	job_id = os.urandom(6).hex()
-	print(f"[HTTP] Created job_id: {job_id}", flush=True)
+	print(f"[HTTP] 📥 New download request - job_id: {job_id}, query: '{query}'", flush=True)
 	queue: asyncio.Queue = asyncio.Queue(maxsize=100)
 	http_polling_events = []  # Separate list for HTTP polling clients
 	confirmation_event = asyncio.Event()
@@ -119,60 +117,69 @@ def http_start_download():
 
 	async def run_job():
 		format_msg = f" (preferred: {preferred_format})" if preferred_format else ""
-		print(f"[JOB {job_id}] Starting download for: {query}{format_msg}", flush=True)
+		print(f"[JOB {job_id}] 🔍 Starting search for: '{query}'{format_msg}", flush=True)
 		try:
 			async for ev in svc.download(query, preferred_format=preferred_format if preferred_format else None, confirmation_event=confirmation_event):
 				# Check if job was cancelled
 				if _jobs.get(job_id, {}).get("cancelled", False):
-					print(f"[JOB {job_id}] Job was cancelled, stopping", flush=True)
+					print(f"[JOB {job_id}] ⛔ Job cancelled by user", flush=True)
 					break
 				
-				print(f"[JOB {job_id}] Event received: {ev.kind} - {ev.message}", flush=True)
+				# Only log important events, not every single event
+				if ev.kind in ("status", "error", "finished", "started", "files_list"):
+					print(f"[JOB {job_id}] 📊 {ev.kind.upper()}: {ev.message}", flush=True)
+				
 				# Track path/finished for streaming
 				if ev.kind == "started" and ev.path:
 					_jobs[job_id]["path"] = ev.path
+					print(f"[JOB {job_id}] ✅ Download started: {ev.path}", flush=True)
 				elif ev.kind == "finished":
 					_jobs[job_id]["finished"] = True
+					print(f"[JOB {job_id}] ✅ Download completed successfully", flush=True)
+				elif ev.kind == "error":
+					print(f"[JOB {job_id}] ❌ ERROR: {ev.message}", flush=True)
+				elif ev.kind == "files_list":
+					files_count = len(ev.files_list) if ev.files_list else 0
+					print(f"[JOB {job_id}] 📋 Found {files_count} candidate files for client check", flush=True)
+				
 				# Enqueue for WS consumers and HTTP polling
 				try:
 					event_dict = ev.__dict__
 					await queue.put(event_dict)
 					# Also add to HTTP polling events list (thread-safe append)
 					_jobs[job_id]["http_polling_events"].append(event_dict)
-					print(f"[JOB {job_id}] Event enqueued: {ev.kind}")
 				except asyncio.CancelledError:
-					print(f"[JOB {job_id}] Cancelled")
+					print(f"[JOB {job_id}] ⛔ Task cancelled", flush=True)
 					break
-			print(f"[JOB {job_id}] Download job completed")
+			print(f"[JOB {job_id}] ✅ Job completed", flush=True)
 		except asyncio.CancelledError:
-			print(f"[JOB {job_id}] Task cancelled", flush=True)
+			print(f"[JOB {job_id}] ⛔ Task cancelled", flush=True)
 		except Exception as e:
-			print(f"[JOB {job_id}] ERROR in run_job: {e}")
+			error_type = type(e).__name__
+			error_msg = str(e)
+			print(f"[JOB {job_id}] ❌ ERROR ({error_type}): {error_msg}", flush=True)
 			import traceback
+			print(f"[JOB {job_id}] 📋 Traceback:", flush=True)
 			traceback.print_exc()
 			if not _jobs.get(job_id, {}).get("cancelled", False):
-				await queue.put({"kind": "error", "message": str(e)})
+				await queue.put({"kind": "error", "message": f"{error_type}: {error_msg}"})
 
 	task = asyncio.run_coroutine_threadsafe(run_job(), _loop)
 	_jobs[job_id]["task"] = task
-	print(f"[JOB {job_id}] Task submitted to event loop", flush=True)
 	# Check if task started successfully
 	try:
 		task.result(timeout=0.1)
 	except asyncio.TimeoutError:
 		pass  # Expected - task is running
 	except Exception as e:
-		print(f"[JOB {job_id}] Task error: {e}")
+		print(f"[JOB {job_id}] ❌ Task error: {e}", flush=True)
 	return {"job_id": job_id}
 
 @app.get("/poll/<job_id>")
 def http_poll_job(job_id: str):
 	"""HTTP polling endpoint for clients that don't support WebSocket"""
-	print(f"[HTTP POLL] GET /poll/{job_id} received", flush=True)
-	print(f"[HTTP POLL] Available jobs: {list(_jobs.keys())}", flush=True)
 	job = _jobs.get(job_id)
 	if not job:
-		print(f"[HTTP POLL] Job {job_id} not found", flush=True)
 		return {"error": "unknown job_id"}, 404
 	
 	http_polling_events = job.get("http_polling_events", [])
@@ -180,45 +187,37 @@ def http_poll_job(job_id: str):
 	# Get the next event from HTTP polling events list (FIFO)
 	if http_polling_events:
 		event = http_polling_events.pop(0)  # Remove and return first event
-		event_kind = event.get('kind') if isinstance(event, dict) else 'unknown'
-		print(f"[HTTP POLL] Returning event: {event_kind} (remaining: {len(http_polling_events)})", flush=True)
 		return event, 200
 	else:
 		# No events available yet
-		print(f"[HTTP POLL] No events available, returning waiting status", flush=True)
 		return {"status": "waiting"}, 200
 
 @app.post("/confirm/<job_id>")
 def http_confirm_download(job_id: str):
 	"""HTTP endpoint for confirming download (for clients without WebSocket)"""
-	print(f"[HTTP CONFIRM] POST /confirm/{job_id} received", flush=True)
-	print(f"[HTTP CONFIRM] Available jobs: {list(_jobs.keys())}", flush=True)
 	job = _jobs.get(job_id)
 	if not job:
-		print(f"[HTTP CONFIRM] Job {job_id} not found", flush=True)
 		return {"error": "unknown job_id"}, 404
 	
 	confirmation_event = job.get("confirmation")
 	if confirmation_event:
 		job["confirmed"] = True
 		# Signal the confirmation event in the event loop
-		# confirmation_event.set() is not a coroutine, it's a regular method
-		# We need to call it in the event loop thread
 		try:
 			# Create a coroutine that calls set()
 			async def set_event():
 				confirmation_event.set()
 			
 			asyncio.run_coroutine_threadsafe(set_event(), _loop)
-			print(f"[HTTP CONFIRM] Download confirmed for job: {job_id}", flush=True)
+			print(f"[HTTP CONFIRM] ✅ Download confirmed for job: {job_id}", flush=True)
 			return {"status": "confirmed"}, 200
 		except Exception as e:
-			print(f"[HTTP CONFIRM] Error setting confirmation event: {e}", flush=True)
+			print(f"[HTTP CONFIRM] ❌ Error setting confirmation event: {e}", flush=True)
 			import traceback
-			print(f"[HTTP CONFIRM] Traceback: {traceback.format_exc()}", flush=True)
+			traceback.print_exc()
 			return {"error": f"Failed to confirm: {str(e)}"}, 500
 	else:
-		print(f"[HTTP CONFIRM] No confirmation event for job: {job_id}", flush=True)
+		print(f"[HTTP CONFIRM] ❌ No confirmation event for job: {job_id}", flush=True)
 		return {"error": "no confirmation event for this job"}, 400
 
 @app.post("/stop/<job_id>")
@@ -326,45 +325,35 @@ def on_stop_download(data):
 def on_subscribe(data):
 	job_id = data.get("job_id")
 	sid = request.sid
-	print(f"[WS] Subscribe request for job: {job_id} from sid: {sid}", flush=True)
 	if not job_id or job_id not in _jobs:
-		print(f"[WS] ERROR: Job {job_id} not found in _jobs", flush=True)
 		emit("error", {"kind": "error", "message": "unknown job_id"})
 		return
 	
 	_job_sids[job_id] = sid
-	print(f"[WS] Connected to job: {job_id}", flush=True)
 	queue: asyncio.Queue = _jobs[job_id]["queue"]
 	
 	# Start background task to drain queue
 	def send_events():
-		print(f"[WS] Background task started for job {job_id}", flush=True)
 		job_finished = False
 		while not job_finished:
 			try:
-				print(f"[WS] Waiting for queue item...", flush=True)
 				item = asyncio.run_coroutine_threadsafe(queue.get(), _loop).result(timeout=60)
-				print(f"[WS] Got item from queue: {item.get('kind')}", flush=True)
 				socketio.emit("progress", item, room=sid)
-				print(f"[WS] Sent event: {item.get('kind')}", flush=True)
 				if item.get("kind") == "finished" or item.get("kind") == "error":
-					print(f"[WS] Job finished/error, stopping background task")
 					job_finished = True
 					break
 			except TimeoutError:
 				# Timeout is normal - just check if job is still active
 				if job_id not in _jobs or _jobs[job_id].get("finished", False):
-					print(f"[WS] Job finished, stopping background task")
 					job_finished = True
 					break
 				# Continue waiting for more events
 				continue
 			except Exception as e:
-				print(f"[WS] Error in loop: {e}")
-				import traceback
-				traceback.print_exc()
+				error_type = type(e).__name__
+				print(f"[WS] ❌ Error in WebSocket loop ({error_type}): {e}", flush=True)
 				# Only break on unexpected errors, not timeouts
-				if "TimeoutError" not in str(type(e).__name__):
+				if "TimeoutError" not in error_type:
 					break
 	
 	socketio.start_background_task(send_events)
@@ -373,10 +362,7 @@ def on_subscribe(data):
 def on_confirm_download(data):
 	job_id = data.get("job_id")
 	sid = request.sid
-	print(f"[WS] Confirm download request received for job: {job_id} from sid: {sid}")
-	print(f"[WS] Data received: {data}")
 	if not job_id or job_id not in _jobs:
-		print(f"[WS] ERROR: Unknown job_id: {job_id}")
 		emit("error", {"kind": "error", "message": "unknown job_id"})
 		return
 	
@@ -385,12 +371,11 @@ def on_confirm_download(data):
 	if confirmation_event:
 		job["confirmed"] = True
 		# Signal the confirmation event in the event loop
-		print(f"[WS] Setting confirmation event for job: {job_id}")
 		asyncio.run_coroutine_threadsafe(confirmation_event.set(), _loop)
-		print(f"[WS] Download confirmed for job: {job_id}")
+		print(f"[WS] ✅ Download confirmed for job: {job_id}", flush=True)
 		emit("progress", {"kind": "status", "message": "Download confirmed, starting..."}, room=sid)
 	else:
-		print(f"[WS] ERROR: No confirmation event for job: {job_id}")
+		print(f"[WS] ❌ No confirmation event for job: {job_id}", flush=True)
 		emit("error", {"kind": "error", "message": "no confirmation event for this job"})
 
 @app.get("/stream/<job_id>")
