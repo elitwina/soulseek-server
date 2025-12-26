@@ -371,7 +371,10 @@ def on_confirm_download(data):
 	if confirmation_event:
 		job["confirmed"] = True
 		# Signal the confirmation event in the event loop
-		asyncio.run_coroutine_threadsafe(confirmation_event.set(), _loop)
+		# confirmation_event.set() is a regular method, not a coroutine, so we need to call it in the event loop thread
+		def set_event():
+			confirmation_event.set()
+		_loop.call_soon_threadsafe(set_event)
 		print(f"[WS] ✅ Download confirmed for job: {job_id}", flush=True)
 		emit("progress", {"kind": "status", "message": "Download confirmed, starting..."}, room=sid)
 	else:
