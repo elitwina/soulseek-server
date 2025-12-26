@@ -124,11 +124,13 @@ def _is_high_quality(filename: str, size: int, ext: str, sim: float) -> bool:
 		return False
 	if ext in ("flac", "wav"):
 		# Require reasonable album-track sizes for lossless
-		return size >= 20_000_000 and sim >= 0.75
+		# Lower similarity threshold to 0.60 to handle names with underscores, hyphens, etc.
+		return size >= 20_000_000 and sim >= 0.60
 	if ext == "mp3":
 		br = _infer_mp3_bitrate_from_name(filename)
 		# Only 320kbps passes quality gate
-		return (br >= 320 and size >= 4_000_000 and sim >= 0.65)
+		# Lower similarity threshold to 0.50 to handle names with underscores, hyphens, etc.
+		return (br >= 320 and size >= 4_000_000 and sim >= 0.50)
 	return False
 
 
@@ -231,8 +233,8 @@ class SoulseekService:
 						yield DownloadEvent(kind="status", message=f"Similarity range: {min_sim:.2f} - {max_sim:.2f}")
 					
 					max_sim = max(x[4] for x in with_scores) if with_scores else 0
-					# Be more lenient with similarity - use 0.15 instead of 0.05 to include more results
-					filtered = [x for x in with_scores if x[4] >= max_sim - 0.15]
+					# Be more lenient with similarity - use 0.30 to include more results (handles underscores, hyphens, etc.)
+					filtered = [x for x in with_scores if x[4] >= max_sim - 0.30]
 					filtered.sort(key=lambda x: _quality_tuple(x[1], x[2], x[3], x[4], preferred_format))
 					filtered = list(reversed(filtered))
 
