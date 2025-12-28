@@ -544,53 +544,65 @@ class SoulseekService:
 									else:
 										raise
 								
-								queued_and_stuck = asyncio.Event()
+								# Return immediately with progress event - monitoring will continue in background
+								# The caller will wait for progress_started to be set
 								
-								async def monitor_queue():
-									await asyncio.sleep(3.0)
-									if queued_notified and not progress_started.is_set():
-										queued_and_stuck.set()
-								
-								monitor_task = asyncio.create_task(monitor_queue())
-								
-								try:
-									done, pending = await asyncio.wait(
-										[asyncio.create_task(progress_started.wait()), monitor_task],
-										timeout=10.0,
-										return_when=asyncio.FIRST_COMPLETED
-									)
+								# Start monitoring in background
+								async def monitor_download():
+									nonlocal c_finished_success
+									queued_and_stuck = asyncio.Event()
 									
-									for task in pending:
-										task.cancel()
-										try:
-											await task
-										except asyncio.CancelledError:
-											pass
+									async def monitor_queue():
+										await asyncio.sleep(3.0)
+										if queued_notified and not progress_started.is_set():
+											queued_and_stuck.set()
 									
-									if queued_and_stuck.is_set():
+									monitor_task = asyncio.create_task(monitor_queue())
+									
+									try:
+										done, pending = await asyncio.wait(
+											[asyncio.create_task(progress_started.wait()), monitor_task],
+											timeout=10.0,
+											return_when=asyncio.FIRST_COMPLETED
+										)
+										
+										for task in pending:
+											task.cancel()
+											try:
+												await task
+											except asyncio.CancelledError:
+												pass
+										
+										if queued_and_stuck.is_set():
+											await client_ref.transfers.abort(transfer_obj)
+											client_ref.events.unregister(TransferRemovedEvent, on_removed_t)
+											client_ref.events.unregister(TransferProgressEvent, on_progress_t)
+											failed_users.add(c_username)
+											print(f"[DOWNLOAD] ⏱️  Candidate #{c_idx} ({c_username}): Stuck in queue, aborting")
+											return
+										
+										if not progress_started.is_set():
+											await client_ref.transfers.abort(transfer_obj)
+											client_ref.events.unregister(TransferRemovedEvent, on_removed_t)
+											client_ref.events.unregister(TransferProgressEvent, on_progress_t)
+											failed_users.add(c_username)
+											print(f"[DOWNLOAD] ⏱️  Candidate #{c_idx} ({c_username}): Timeout, aborting")
+											return
+									except asyncio.TimeoutError:
 										await client_ref.transfers.abort(transfer_obj)
 										client_ref.events.unregister(TransferRemovedEvent, on_removed_t)
 										client_ref.events.unregister(TransferProgressEvent, on_progress_t)
 										failed_users.add(c_username)
-										print(f"[DOWNLOAD] ⏱️  Candidate #{c_idx} ({c_username}): Stuck in queue, aborting")
-										return None, None, None, False
+										print(f"[DOWNLOAD] ⏱️  Candidate #{c_idx} ({c_username}): Timeout exception, aborting")
+										return
 									
-									if not progress_started.is_set():
-										await client_ref.transfers.abort(transfer_obj)
-										client_ref.events.unregister(TransferRemovedEvent, on_removed_t)
-										client_ref.events.unregister(TransferProgressEvent, on_progress_t)
-										failed_users.add(c_username)
-										print(f"[DOWNLOAD] ⏱️  Candidate #{c_idx} ({c_username}): Timeout, aborting")
-										return None, None, None, False
-								except asyncio.TimeoutError:
-									await client_ref.transfers.abort(transfer_obj)
-									client_ref.events.unregister(TransferRemovedEvent, on_removed_t)
-									client_ref.events.unregister(TransferProgressEvent, on_progress_t)
-									failed_users.add(c_username)
-									print(f"[DOWNLOAD] ⏱️  Candidate #{c_idx} ({c_username}): Timeout exception, aborting")
-									return None, None, None, False
+									# If we get here, download started - continue monitoring until completion
+									# The main loop will handle streaming events
 								
-								# Download started successfully - return the queue, transfer, and progress event
+								# Start monitoring in background
+								asyncio.create_task(monitor_download())
+								
+								# Return immediately with progress event
 								return download_queue, transfer_obj, progress_started, c_finished_success
 							
 							# Create task for this candidate
@@ -603,81 +615,98 @@ class SoulseekService:
 						successful_transfer = None
 						successful_progress_event = None
 						
-						# Get progress events from all tasks
+						# Map progress events to their tasks
+						progress_to_task = {}
 						progress_events = []
-						task_results = {}
 						
-						# Wait for all tasks to complete their initial setup (download initiation)
-						# Then wait for one to start downloading
 						try:
-							# First, wait for all tasks to initiate downloads (or fail)
-							done, pending = await asyncio.wait(download_tasks, timeout=15.0, return_when=asyncio.ALL_COMPLETED)
+							# Wait for all tasks to initiate downloads and return their progress events
+							done_init, pending_init = await asyncio.wait(download_tasks, timeout=5.0, return_when=asyncio.ALL_COMPLETED)
 							
-							# Collect results
+							# Collect progress events from all tasks
 							for task in download_tasks:
 								try:
 									queue, transfer, progress_evt, success = await task
-									task_results[task] = (queue, transfer, progress_evt, success)
-									if progress_evt is not None:
+									if progress_evt is not None and transfer is not None:
 										progress_events.append(progress_evt)
+										progress_to_task[progress_evt] = (task, queue, transfer)
+										print(f"[DOWNLOAD] 📋 Candidate #{task_info[task][2]} initialized, waiting for download to start...")
+									elif transfer is None:
+										print(f"[DOWNLOAD] ❌ Candidate #{task_info[task][2]} failed to initialize")
 								except Exception as e:
-									print(f"[DOWNLOAD] ⚠️  Task error: {e}")
+									print(f"[DOWNLOAD] ⚠️  Task error for candidate #{task_info[task][2]}: {e}")
 							
-							# If we have progress events, wait for one to start
+							# If we have progress events, wait for one to start downloading
 							if progress_events:
 								print(f"[DOWNLOAD] ⏳ Waiting for one of {len(progress_events)} candidate(s) to start downloading...")
+								yield DownloadEvent(kind="status", message=f"Waiting for one of {len(progress_events)} candidate(s) to start...")
+								
 								done_progress, pending_progress = await asyncio.wait(
 									[asyncio.create_task(ev.wait()) for ev in progress_events],
 									timeout=15.0,
 									return_when=asyncio.FIRST_COMPLETED
 								)
 								
-								# Find which one started
-								for task, (queue, transfer, progress_evt, success) in task_results.items():
-									if progress_evt in done_progress and queue is not None and transfer is not None:
-										successful_queue = queue
-										successful_transfer = transfer
-										successful_progress_event = progress_evt
-										print(f"[DOWNLOAD] 🎯 Candidate #{task_info[task][2]} ({task_info[task][0]}) started - aborting others")
-										
-										# Abort all other transfers
-										for other_task, (other_queue, other_transfer, other_progress, other_success) in task_results.items():
-											if other_task != task and other_transfer is not None:
+								# Find which progress event fired
+								found_successful = False
+								for progress_evt in progress_events:
+									if progress_evt.is_set():
+										task, queue, transfer = progress_to_task[progress_evt]
+										if queue is not None and transfer is not None:
+											successful_queue = queue
+											successful_transfer = transfer
+											successful_progress_event = progress_evt
+											found_successful = True
+											print(f"[DOWNLOAD] 🎯 Candidate #{task_info[task][2]} ({task_info[task][0]}) started - aborting others")
+											
+											# Abort all other transfers
+											for other_progress_evt, (other_task, other_queue, other_transfer) in progress_to_task.items():
+												if other_progress_evt != progress_evt and other_transfer is not None:
+													try:
+														await client.transfers.abort(other_transfer)
+														print(f"[DOWNLOAD] 🛑 Aborted candidate #{task_info[other_task][2]}")
+													except Exception as abort_err:
+														print(f"[DOWNLOAD] ⚠️  Failed to abort candidate #{task_info[other_task][2]}: {abort_err}")
+											
+											# Stream events from successful download
+											while True:
 												try:
-													await client.transfers.abort(other_transfer)
-													print(f"[DOWNLOAD] 🛑 Aborted candidate #{task_info[other_task][2]}")
-												except Exception as abort_err:
-													print(f"[DOWNLOAD] ⚠️  Failed to abort candidate #{task_info[other_task][2]}: {abort_err}")
-										
-										# Stream events from successful download
-										while True:
-											try:
-												ev = await asyncio.wait_for(successful_queue.get(), timeout=0.2)
-												yield ev
-												if ev.kind == "finished":
-													finished_success = True
-													print(f"[DOWNLOAD] ✅ Download completed successfully")
+													ev = await asyncio.wait_for(successful_queue.get(), timeout=0.5)
+													yield ev
+													if ev.kind == "finished":
+														finished_success = True
+														print(f"[DOWNLOAD] ✅ Download completed successfully")
+														break
+													if ev.kind == "status" and "failed" in ev.message:
+														print(f"[DOWNLOAD] ❌ Download failed: {ev.message}")
+														failed_users.add(task_info[task][0])
+														break
+												except asyncio.TimeoutError:
+													# Check if download is still active
+													if successful_progress_event.is_set():
+														continue
+													else:
+														# Download stopped
+														break
+											
+											# Drain remaining events
+											while not successful_queue.empty():
+												try:
+													ev = await asyncio.wait_for(successful_queue.get(), timeout=0.1)
+													yield ev
+													if ev.kind == "finished":
+														finished_success = True
+												except asyncio.TimeoutError:
 													break
-												if ev.kind == "status" and "failed" in ev.message:
-													print(f"[DOWNLOAD] ❌ Download failed")
-													break
-											except asyncio.TimeoutError:
-												# Check if download is still active
-												if successful_progress_event.is_set():
-													continue
-												else:
-													break
-										
-										# Drain remaining events
-										while not successful_queue.empty():
-											ev = await successful_queue.get()
-											yield ev
-										
-										if finished_success:
-											break
+											
+											if finished_success:
+												break
+								
+								if not found_successful:
+									print(f"[DOWNLOAD] ❌ Batch {batch_num}: No candidate started downloading within timeout")
 							else:
-								# No progress events - all failed
-								print(f"[DOWNLOAD] ❌ Batch {batch_num}: All candidates failed to start")
+								# No progress events - all failed to initialize
+								print(f"[DOWNLOAD] ❌ Batch {batch_num}: All candidates failed to initialize")
 						except Exception as e:
 							print(f"[DOWNLOAD] ⚠️  Batch {batch_num} error: {e}")
 							import traceback
