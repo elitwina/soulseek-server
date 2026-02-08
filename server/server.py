@@ -73,6 +73,11 @@ def http_start_download():
 		print(f"[JOB {job_id}] Starting download for: {query}{format_msg}")
 		try:
 			async for ev in svc.download(query, preferred_format=preferred_format if preferred_format else None, confirmation_event=confirmation_event):
+				# Check if job was stopped
+				if _jobs.get(job_id, {}).get("stopped"):
+					print(f"[JOB {job_id}] Stopped by user")
+					await queue.put({"kind": "cancelled", "message": "Stopped by user"})
+					break
 				# Log events - progress on same line, others on new line
 				if ev.kind == "progress":
 					print(f"\r[JOB {job_id}] Downloading: {ev.percent}%", end="", flush=True)
@@ -88,8 +93,15 @@ def http_start_download():
 					await queue.put(ev.__dict__)
 				except asyncio.CancelledError:
 					print(f"[JOB {job_id}] Cancelled")
+					await queue.put({"kind": "cancelled", "message": "Cancelled"})
 					break
 			print(f"[JOB {job_id}] Download job completed")
+		except asyncio.CancelledError:
+			print(f"[JOB {job_id}] Cancelled by user")
+			try:
+				await queue.put({"kind": "cancelled", "message": "Cancelled by user"})
+			except:
+				pass
 		except Exception as e:
 			print(f"[JOB {job_id}] ERROR in run_job: {e}")
 			import traceback
@@ -151,7 +163,7 @@ def on_confirm_download(data):
 	if not job_id or job_id not in _jobs:
 		emit("error", {"kind": "error", "message": "unknown job_id"})
 		return
-	
+
 	job = _jobs[job_id]
 	confirmation_event = job.get("confirmation")
 	if confirmation_event:
@@ -162,6 +174,27 @@ def on_confirm_download(data):
 		emit("progress", {"kind": "status", "message": "Download confirmed, starting..."}, room=sid)
 	else:
 		emit("error", {"kind": "error", "message": "no confirmation event for this job"})
+
+@socketio.on("stop_download")
+def on_stop_download(data):
+	job_id = data.get("job_id")
+	sid = request.sid
+	print(f"[WS] Stop download request for job: {job_id} from sid: {sid}")
+	if not job_id or job_id not in _jobs:
+		emit("error", {"kind": "error", "message": "unknown job_id"})
+		return
+
+	job = _jobs[job_id]
+	# Mark job as stopped
+	job["stopped"] = True
+	# Cancel the task if it exists
+	task = job.get("task")
+	if task and not task.done():
+		task.cancel()
+		print(f"[WS] Job {job_id} cancelled")
+	# Send cancelled event to client
+	emit("progress", {"kind": "cancelled", "message": "Download stopped by user"}, room=sid)
+	print(f"[WS] Download stopped for job: {job_id}")
 
 @app.get("/stream/<job_id>")
 def http_stream_file(job_id: str):
