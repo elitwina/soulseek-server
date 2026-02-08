@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import os
 import time
 from threading import Thread
@@ -11,19 +10,8 @@ from flask_socketio import SocketIO, emit
 
 from slsk_service import SoulseekService, DownloadEvent
 
-# Configure logging to suppress verbose aioslsk peer connection errors
-logging.getLogger('aioslsk').setLevel(logging.WARNING)
-logging.getLogger('aioslsk.network').setLevel(logging.WARNING)
-logging.getLogger('aioslsk.transfer').setLevel(logging.WARNING)
-
 app = Flask(__name__)
-# Let Flask-SocketIO auto-detect the best async mode
-# It will prefer eventlet, then gevent, then threading
-# For production with gunicorn, we can use eventlet or gevent
-# If SOCKETIO_ASYNC_MODE is not set, Flask-SocketIO will auto-detect
-# For development, use threading to avoid output buffering issues with eventlet
-async_mode = os.environ.get("SOCKETIO_ASYNC_MODE", "threading")  # Default to threading for development
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode=async_mode)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # Configure credentials and paths
 USERNAME = "DjLic"
@@ -35,38 +23,8 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # Run an event loop in a background thread for aioslsk
 _loop = asyncio.new_event_loop()
 
-def _handle_exception(loop, context):
-	"""Handle unhandled exceptions in the event loop, especially from aioslsk background tasks."""
-	exception = context.get('exception')
-	message = context.get('message', '')
-	
-	# Filter out expected peer connection errors that are normal during downloads
-	if exception:
-		exception_type = type(exception).__name__
-		exception_str = str(exception)
-		
-		# These are expected network errors during peer connection attempts
-		if 'PeerConnectionError' in exception_type or 'PeerConnectionError' in exception_str:
-			# Only log at debug level, these are expected
-			if 'indirect connection' in exception_str or 'failed connect' in exception_str:
-				# These are normal - peer might be behind NAT/firewall
-				return
-		
-		# Log other unexpected exceptions
-		print(f"[EVENT_LOOP] Unhandled exception: {exception_type}: {exception_str}")
-		if 'Task exception was never retrieved' not in message:
-			print(f"[EVENT_LOOP] Context: {message}")
-	else:
-		# Log non-exception context messages
-		if 'Task exception was never retrieved' in message:
-			# This is usually from aioslsk background tasks, can be ignored
-			return
-		print(f"[EVENT_LOOP] {message}")
-
 def _run_loop(loop):
 	asyncio.set_event_loop(loop)
-	# Set exception handler to catch unhandled exceptions from background tasks
-	loop.set_exception_handler(_handle_exception)
 	loop.run_forever()
 
 _thread = Thread(target=_run_loop, args=(_loop,), daemon=True)
@@ -85,17 +43,13 @@ def http_start_download():
 		return {"error": "missing query"}, 400
 
 	job_id = os.urandom(6).hex()
-	print(f"[HTTP] 📥 New download request - job_id: {job_id}, query: '{query}'", flush=True)
 	queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-	http_polling_events = []  # Separate list for HTTP polling clients
 	confirmation_event = asyncio.Event()
 	_jobs[job_id] = {
 		"query": query,
 		"queue": queue,
-		"http_polling_events": http_polling_events,
 		"path": None,
 		"finished": False,
-		"cancelled": False,
 		"confirmation": confirmation_event,
 		"confirmed": False,
 	}
@@ -104,257 +58,80 @@ def http_start_download():
 	if preferred_format and preferred_format not in ("mp3", "flac"):
 		preferred_format = None
 	
-	# Get search_timeout from request (default: 10 seconds)
-	search_timeout = data.get("search_timeout", 10)
-	try:
-		search_timeout = int(search_timeout)
-		if search_timeout < 1 or search_timeout > 60:
-			search_timeout = 10  # Clamp to reasonable range
-	except (ValueError, TypeError):
-		search_timeout = 10  # Default if invalid
-	
-	svc = SoulseekService(USERNAME, PASSWORD, DOWNLOAD_DIR, search_timeout=search_timeout)
+	svc = SoulseekService(USERNAME, PASSWORD, DOWNLOAD_DIR, search_timeout=10)
 
 	async def run_job():
 		format_msg = f" (preferred: {preferred_format})" if preferred_format else ""
-		print(f"[JOB {job_id}] 🔍 Starting search for: '{query}'{format_msg}", flush=True)
+		print(f"[JOB {job_id}] Starting download for: {query}{format_msg}")
 		try:
 			async for ev in svc.download(query, preferred_format=preferred_format if preferred_format else None, confirmation_event=confirmation_event):
-				# Check if job was cancelled
-				if _jobs.get(job_id, {}).get("cancelled", False):
-					print(f"[JOB {job_id}] ⛔ Job cancelled by user", flush=True)
-					break
-				
-				# Only log important events, not every single event
-				if ev.kind in ("status", "error", "finished", "started", "files_list"):
-					print(f"[JOB {job_id}] 📊 {ev.kind.upper()}: {ev.message}", flush=True)
-				
+				print(f"[JOB {job_id}] Event received: {ev.kind} - {ev.message}")
 				# Track path/finished for streaming
 				if ev.kind == "started" and ev.path:
 					_jobs[job_id]["path"] = ev.path
-					print(f"[JOB {job_id}] ✅ Download started: {ev.path}", flush=True)
 				elif ev.kind == "finished":
 					_jobs[job_id]["finished"] = True
-					print(f"[JOB {job_id}] ✅ Download completed successfully", flush=True)
-				elif ev.kind == "error":
-					print(f"[JOB {job_id}] ❌ ERROR: {ev.message}", flush=True)
-				elif ev.kind == "files_list":
-					files_count = len(ev.files_list) if ev.files_list else 0
-					print(f"[JOB {job_id}] 📋 Found {files_count} candidate files for client check", flush=True)
-				
-				# Enqueue for WS consumers and HTTP polling
+				# Enqueue for WS consumers
 				try:
-					event_dict = ev.__dict__
-					await queue.put(event_dict)
-					# Also add to HTTP polling events list (thread-safe append)
-					_jobs[job_id]["http_polling_events"].append(event_dict)
+					await queue.put(ev.__dict__)
+					print(f"[JOB {job_id}] Event enqueued: {ev.kind}")
 				except asyncio.CancelledError:
-					print(f"[JOB {job_id}] ⛔ Task cancelled", flush=True)
+					print(f"[JOB {job_id}] Cancelled")
 					break
-			print(f"[JOB {job_id}] ✅ Job completed", flush=True)
-		except asyncio.CancelledError:
-			print(f"[JOB {job_id}] ⛔ Task cancelled", flush=True)
+			print(f"[JOB {job_id}] Download job completed")
 		except Exception as e:
-			error_type = type(e).__name__
-			error_msg = str(e)
-			print(f"[JOB {job_id}] ❌ ERROR ({error_type}): {error_msg}", flush=True)
+			print(f"[JOB {job_id}] ERROR in run_job: {e}")
 			import traceback
-			print(f"[JOB {job_id}] 📋 Traceback:", flush=True)
 			traceback.print_exc()
-			if not _jobs.get(job_id, {}).get("cancelled", False):
-				await queue.put({"kind": "error", "message": f"{error_type}: {error_msg}"})
+			await queue.put({"kind": "error", "message": str(e)})
 
 	task = asyncio.run_coroutine_threadsafe(run_job(), _loop)
 	_jobs[job_id]["task"] = task
+	print(f"[JOB {job_id}] Task submitted to event loop")
 	# Check if task started successfully
 	try:
 		task.result(timeout=0.1)
 	except asyncio.TimeoutError:
 		pass  # Expected - task is running
 	except Exception as e:
-		print(f"[JOB {job_id}] ❌ Task error: {e}", flush=True)
+		print(f"[JOB {job_id}] Task error: {e}")
 	return {"job_id": job_id}
-
-@app.get("/poll/<job_id>")
-def http_poll_job(job_id: str):
-	"""HTTP polling endpoint for clients that don't support WebSocket"""
-	job = _jobs.get(job_id)
-	if not job:
-		return {"error": "unknown job_id"}, 404
-	
-	http_polling_events = job.get("http_polling_events", [])
-	
-	# Get the next event from HTTP polling events list (FIFO)
-	if http_polling_events:
-		event = http_polling_events.pop(0)  # Remove and return first event
-		return event, 200
-	else:
-		# No events available yet
-		return {"status": "waiting"}, 200
-
-@app.post("/confirm/<job_id>")
-def http_confirm_download(job_id: str):
-	"""HTTP endpoint for confirming download (for clients without WebSocket)"""
-	job = _jobs.get(job_id)
-	if not job:
-		return {"error": "unknown job_id"}, 404
-	
-	confirmation_event = job.get("confirmation")
-	if confirmation_event:
-		job["confirmed"] = True
-		# Signal the confirmation event in the event loop
-		try:
-			# Create a coroutine that calls set()
-			async def set_event():
-				confirmation_event.set()
-			
-			asyncio.run_coroutine_threadsafe(set_event(), _loop)
-			print(f"[HTTP CONFIRM] ✅ Download confirmed for job: {job_id}", flush=True)
-			return {"status": "confirmed"}, 200
-		except Exception as e:
-			print(f"[HTTP CONFIRM] ❌ Error setting confirmation event: {e}", flush=True)
-			import traceback
-			traceback.print_exc()
-			return {"error": f"Failed to confirm: {str(e)}"}, 500
-	else:
-		print(f"[HTTP CONFIRM] ❌ No confirmation event for job: {job_id}", flush=True)
-		return {"error": "no confirmation event for this job"}, 400
-
-@app.post("/stop/<job_id>")
-def http_stop_download(job_id: str):
-	"""HTTP endpoint for stopping/cancelling a download"""
-	print(f"[HTTP STOP] POST /stop/{job_id} received", flush=True)
-	job = _jobs.get(job_id)
-	if not job:
-		print(f"[HTTP STOP] Job {job_id} not found", flush=True)
-		return {"error": "unknown job_id"}, 404
-	
-	# Mark job as cancelled
-	job["cancelled"] = True
-	job["finished"] = True
-	
-	# Cancel the task if it exists
-	task = job.get("task")
-	if task:
-		try:
-			task.cancel()
-			print(f"[HTTP STOP] Task cancelled for job: {job_id}", flush=True)
-		except Exception as e:
-			print(f"[HTTP STOP] Error cancelling task: {e}", flush=True)
-	
-	# Delete the temporary file if it exists
-	file_path = job.get("path")
-	if file_path and os.path.exists(file_path):
-		try:
-			os.remove(file_path)
-			print(f"[HTTP STOP] Deleted file: {file_path}", flush=True)
-		except Exception as e:
-			print(f"[HTTP STOP] Error deleting file: {e}", flush=True)
-	
-	# Send cancellation event to clients
-	cancellation_event = {"kind": "cancelled", "message": "Download cancelled by user"}
-	queue = job.get("queue")
-	if queue:
-		try:
-			asyncio.run_coroutine_threadsafe(queue.put(cancellation_event), _loop)
-		except Exception as e:
-			print(f"[HTTP STOP] Error sending cancellation event: {e}", flush=True)
-	
-	# Add to HTTP polling events
-	http_polling_events = job.get("http_polling_events", [])
-	http_polling_events.append(cancellation_event)
-	
-	print(f"[HTTP STOP] Download stopped for job: {job_id}", flush=True)
-	return {"status": "stopped"}, 200
 
 @socketio.on("connect")
 def on_connect():
-	print(f"[WS] New WebSocket connection", flush=True)
-
-@socketio.on("stop_download")
-def on_stop_download(data):
-	"""WebSocket event to stop a download"""
-	job_id = data.get("job_id")
-	sid = request.sid
-	print(f"[WS] Stop download request for job: {job_id} from sid: {sid}", flush=True)
-	
-	if not job_id or job_id not in _jobs:
-		print(f"[WS] ERROR: Job {job_id} not found in _jobs", flush=True)
-		emit("error", {"kind": "error", "message": "unknown job_id"})
-		return
-	
-	job = _jobs[job_id]
-	job["cancelled"] = True
-	job["finished"] = True
-	
-	# Cancel the task if it exists
-	task = job.get("task")
-	if task:
-		try:
-			task.cancel()
-			print(f"[WS] Task cancelled for job: {job_id}", flush=True)
-		except Exception as e:
-			print(f"[WS] Error cancelling task: {e}", flush=True)
-	
-	# Delete the temporary file if it exists
-	file_path = job.get("path")
-	if file_path and os.path.exists(file_path):
-		try:
-			os.remove(file_path)
-			print(f"[WS] Deleted file: {file_path}", flush=True)
-		except Exception as e:
-			print(f"[WS] Error deleting file: {e}", flush=True)
-	
-	# Send cancellation event
-	cancellation_event = {"kind": "cancelled", "message": "Download cancelled by user"}
-	queue = job.get("queue")
-	if queue:
-		try:
-			asyncio.run_coroutine_threadsafe(queue.put(cancellation_event), _loop)
-		except Exception as e:
-			print(f"[WS] Error sending cancellation event: {e}", flush=True)
-	
-	# Add to HTTP polling events
-	http_polling_events = job.get("http_polling_events", [])
-	http_polling_events.append(cancellation_event)
-	
-	emit("progress", cancellation_event, room=sid)
-	print(f"[WS] Download stopped for job: {job_id}", flush=True)
+	print(f"[WS] New WebSocket connection")
 
 @socketio.on("subscribe")
 def on_subscribe(data):
 	job_id = data.get("job_id")
 	sid = request.sid
+	print(f"[WS] Subscribe request for job: {job_id} from sid: {sid}")
 	if not job_id or job_id not in _jobs:
 		emit("error", {"kind": "error", "message": "unknown job_id"})
 		return
 	
 	_job_sids[job_id] = sid
+	print(f"[WS] Connected to job: {job_id}")
 	queue: asyncio.Queue = _jobs[job_id]["queue"]
 	
 	# Start background task to drain queue
 	def send_events():
-		job_finished = False
-		while not job_finished:
+		print(f"[WS] Background task started for job {job_id}")
+		while True:
 			try:
+				print(f"[WS] Waiting for queue item...")
 				item = asyncio.run_coroutine_threadsafe(queue.get(), _loop).result(timeout=60)
+				print(f"[WS] Got item from queue: {item.get('kind')}")
 				socketio.emit("progress", item, room=sid)
-				if item.get("kind") == "finished" or item.get("kind") == "error":
-					job_finished = True
+				print(f"[WS] Sent event: {item.get('kind')}")
+				if item.get("kind") == "finished":
+					print(f"[WS] Job finished, stopping background task")
 					break
-			except TimeoutError:
-				# Timeout is normal - just check if job is still active
-				if job_id not in _jobs or _jobs[job_id].get("finished", False):
-					job_finished = True
-					break
-				# Continue waiting for more events
-				continue
 			except Exception as e:
-				error_type = type(e).__name__
-				print(f"[WS] ❌ Error in WebSocket loop ({error_type}): {e}", flush=True)
-				# Only break on unexpected errors, not timeouts
-				if "TimeoutError" not in error_type:
-					break
+				print(f"[WS] Error in loop: {e}")
+				import traceback
+				traceback.print_exc()
+				break
 	
 	socketio.start_background_task(send_events)
 
@@ -362,6 +139,7 @@ def on_subscribe(data):
 def on_confirm_download(data):
 	job_id = data.get("job_id")
 	sid = request.sid
+	print(f"[WS] Confirm download request for job: {job_id} from sid: {sid}")
 	if not job_id or job_id not in _jobs:
 		emit("error", {"kind": "error", "message": "unknown job_id"})
 		return
@@ -371,14 +149,10 @@ def on_confirm_download(data):
 	if confirmation_event:
 		job["confirmed"] = True
 		# Signal the confirmation event in the event loop
-		# confirmation_event.set() is a regular method, not a coroutine, so we need to call it in the event loop thread
-		def set_event():
-			confirmation_event.set()
-		_loop.call_soon_threadsafe(set_event)
-		print(f"[WS] ✅ Download confirmed for job: {job_id}", flush=True)
+		asyncio.run_coroutine_threadsafe(confirmation_event.set(), _loop)
+		print(f"[WS] Download confirmed for job: {job_id}")
 		emit("progress", {"kind": "status", "message": "Download confirmed, starting..."}, room=sid)
 	else:
-		print(f"[WS] ❌ No confirmation event for job: {job_id}", flush=True)
 		emit("error", {"kind": "error", "message": "no confirmation event for this job"})
 
 @app.get("/stream/<job_id>")
@@ -447,25 +221,6 @@ def http_stream_file(job_id: str):
 	return Response(stream_with_context(generate()), mimetype="application/octet-stream")
 
 if __name__ == "__main__":
-	# Development mode - use Flask dev server
-	import sys
-	sys.stdout.flush()  # Ensure output is not buffered
 	port = int(os.environ.get("PORT", 8001))
-	print(f"[SERVER] Starting server on port {port}...", flush=True)
-	print(f"[SERVER] SocketIO async_mode: {socketio.async_mode}", flush=True)
-	print(f"[SERVER] Download directory: {DOWNLOAD_DIR}", flush=True)
-	print(f"[SERVER] Server will be available at http://0.0.0.0:{port}", flush=True)
-	print(f"[SERVER] Press CTRL+C to stop", flush=True)
-	try:
-		socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
-	except KeyboardInterrupt:
-		print("\n[SERVER] Shutting down...", flush=True)
-	except Exception as e:
-		print(f"[SERVER] Error starting server: {e}", flush=True)
-		import traceback
-		traceback.print_exc()
-else:
-	# Production mode - gunicorn will import this module
-	# The app and socketio objects are already created above
-	pass
+	socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
 

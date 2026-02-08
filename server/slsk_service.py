@@ -124,13 +124,11 @@ def _is_high_quality(filename: str, size: int, ext: str, sim: float) -> bool:
 		return False
 	if ext in ("flac", "wav"):
 		# Require reasonable album-track sizes for lossless
-		# Lower similarity threshold to 0.60 to handle names with underscores, hyphens, etc.
-		return size >= 20_000_000 and sim >= 0.60
+		return size >= 20_000_000 and sim >= 0.75
 	if ext == "mp3":
 		br = _infer_mp3_bitrate_from_name(filename)
 		# Only 320kbps passes quality gate
-		# Lower similarity threshold to 0.50 to handle names with underscores, hyphens, etc.
-		return (br >= 320 and size >= 4_000_000 and sim >= 0.50)
+		return (br >= 320 and size >= 4_000_000 and sim >= 0.65)
 	return False
 
 
@@ -173,22 +171,10 @@ class SoulseekService:
 		max_retries = 3
 		for attempt in range(max_retries):
 			try:
-				print(f"[SEARCH] 🔌 Connecting to Soulseek (attempt {attempt + 1}/{max_retries})...")
 				async with SoulSeekClient(settings=settings) as client:
-					print(f"[SEARCH] 🔐 Logging in to Soulseek...")
 					await client.login()
-					print(f"[SEARCH] ✅ Successfully logged in to Soulseek")
-
-					search_request_id = None
-					search_started = False
 
 					async def on_result(event: SearchResultEvent):
-						nonlocal search_started
-						if not search_started:
-							search_started = True
-							print(f"[SEARCH] 📡 Search request active, receiving results...")
-						
-						result_count = 0
 						for file in list(event.result.shared_items) + list(event.result.locked_results):
 							ext = (file.extension or os.path.splitext(file.filename)[1][1:]).lower()
 							if ext not in ALLOWED_EXTS:
@@ -197,56 +183,22 @@ class SoulseekService:
 							if fsize < MIN_SIZE_BYTES:
 								continue
 							collected.append((event.result.username, file.filename, fsize, ext))
-							result_count += 1
-						
-						if result_count > 0:
-							print(f"[SEARCH] 📥 Received {result_count} file(s) from user '{event.result.username}' (total collected: {len(collected)})")
 
 					async def on_removed(event: SearchRequestRemovedEvent):
-						nonlocal search_request_id
-						# Check if this is our search request
-						if search_request_id and event.request_id == search_request_id:
-							print(f"[SEARCH] ⚠️  Search request was removed by server (request_id: {search_request_id})")
-							print(f"[SEARCH] ⚠️  This usually means: session expired, timeout, or server closed the search")
-							if not collected:
-								print(f"[SEARCH] ❌ No results collected before search was removed")
-							else:
-								print(f"[SEARCH] ✅ Collected {len(collected)} results before search was removed")
 						stop_event.set()
 
 					client.events.register(SearchResultEvent, on_result)
 					client.events.register(SearchRequestRemovedEvent, on_removed)
 
-					print(f"[SEARCH] 🔍 Sending search request for: '{query}' (timeout: {self.search_timeout}s)")
-					search_request = await client.searches.search(query)
-					search_request_id = search_request.request_id if hasattr(search_request, 'request_id') else None
-					print(f"[SEARCH] ✅ Search request sent (request_id: {search_request_id})")
-					
+					_ = await client.searches.search(query)
 					await event_queue.put(DownloadEvent(kind="status", message=f"searching '{query}' ({self.search_timeout}s)"))
-					
 					# Yield events in real-time while waiting for search to end
-					search_timeout_reached = False
-					search_start_time = asyncio.get_event_loop().time()
 					while not stop_event.is_set():
 						try:
 							ev = await asyncio.wait_for(event_queue.get(), timeout=0.2)
 							yield ev
 						except asyncio.TimeoutError:
-							# Check if search timeout was reached
-							elapsed = asyncio.get_event_loop().time() - search_start_time
-							if elapsed >= self.search_timeout and not search_timeout_reached:
-								search_timeout_reached = True
-								print(f"[SEARCH] ⏱️  Search timeout reached ({self.search_timeout}s), stopping search")
-								# Try to remove the search request if possible
-								if search_request_id:
-									try:
-										await client.searches.remove(search_request_id)
-										print(f"[SEARCH] 🗑️  Removed search request {search_request_id}")
-									except Exception as e:
-										print(f"[SEARCH] ⚠️  Could not remove search request: {e}")
-								stop_event.set()
 							pass
-					
 					# Drain remaining queued events
 					while not event_queue.empty():
 						ev = await event_queue.get()
@@ -256,17 +208,14 @@ class SoulseekService:
 					client.events.unregister(SearchRequestRemovedEvent, on_removed)
 
 					if not collected:
-						print(f"[SEARCH] ❌ No results found for: '{query}'")
 						yield DownloadEvent(kind="error", message="no results")
 						return
 
 					# Log how many results we collected
 					unique_users_collected = len(set(x[0] for x in collected))
-					print(f"[SEARCH] ✅ Search completed: Found {len(collected)} file(s) from {unique_users_collected} unique user(s)")
 					yield DownloadEvent(kind="status", message=f"Collected {len(collected)} files from {unique_users_collected} unique user(s)")
 
 					target = _basename_without_ext(query)
-					print(f"[SEARCH] 🔍 Calculating similarity scores for {len(collected)} files...")
 					with_scores = [(
 						username,
 						filename,
@@ -279,21 +228,15 @@ class SoulseekService:
 					if with_scores:
 						max_sim = max(x[4] for x in with_scores)
 						min_sim = min(x[4] for x in with_scores)
-						print(f"[SEARCH] 📊 Similarity range: {min_sim:.2f} - {max_sim:.2f}")
 						yield DownloadEvent(kind="status", message=f"Similarity range: {min_sim:.2f} - {max_sim:.2f}")
 					
 					max_sim = max(x[4] for x in with_scores) if with_scores else 0
-					# Be more lenient with similarity - use 0.30 to include more results (handles underscores, hyphens, etc.)
-					similarity_threshold = max_sim - 0.30
-					print(f"[SEARCH] 🎯 Filtering results (similarity threshold: {similarity_threshold:.2f})...")
-					filtered = [x for x in with_scores if x[4] >= similarity_threshold]
-					print(f"[SEARCH] ✅ After similarity filtering: {len(filtered)} file(s) remaining (from {len(with_scores)} total)")
-					
+					# Be more lenient with similarity - use 0.15 instead of 0.05 to include more results
+					filtered = [x for x in with_scores if x[4] >= max_sim - 0.15]
 					filtered.sort(key=lambda x: _quality_tuple(x[1], x[2], x[3], x[4], preferred_format))
 					filtered = list(reversed(filtered))
 
 					# Deduplicate by username: keep only the best candidate per user
-					print(f"[SEARCH] 🔄 Deduplicating by username...")
 					seen_users = set()
 					dedup = []
 					for x in filtered:
@@ -311,12 +254,9 @@ class SoulseekService:
 							if len(dedup) >= 5:
 								break
 					filtered = dedup
-					print(f"[SEARCH] ✅ After deduplication: {len(filtered)} unique file(s) from {len(seen_users)} user(s)")
 
 					# Apply high-quality gate for initial selection
-					print(f"[SEARCH] 🎚️  Applying quality filter...")
 					hq = [x for x in filtered if _is_high_quality(x[1], x[2], x[3], x[4])]
-					print(f"[SEARCH] ✅ High-quality files: {len(hq)} out of {len(filtered)}")
 					if hq:
 						# If preferred_format is mp3, prioritize MP3 320 from HQ candidates
 						if preferred_format and preferred_format.lower() == "mp3":
@@ -377,20 +317,8 @@ class SoulseekService:
 							candidates = fallback or filtered
 							yield DownloadEvent(kind="status", message=f"no HQ found; using {len(candidates)} filtered candidates")
 
-					# Prepare fallback candidates (all filtered files, not just high-quality)
-					# If high-quality candidates fail, we'll try the rest
-					fallback_candidates = []
-					if hq and candidates == hq:
-						# If we're using only high-quality, prepare fallback from filtered
-						fallback_candidates = [x for x in filtered if x not in hq]
-						if fallback_candidates:
-							print(f"[SEARCH] 🔄 Prepared {len(fallback_candidates)} fallback candidate(s) in case high-quality fails")
-					
 					# Send list of candidate file names to client for existence check
-					# Include both primary candidates and fallback candidates
-					all_candidates_for_client = candidates + fallback_candidates
-					candidate_filenames = [x[1] for x in all_candidates_for_client]  # Extract just the filenames
-					print(f"[SEARCH] 📋 Sending {len(candidate_filenames)} candidate file(s) to client for verification ({len(candidates)} primary, {len(fallback_candidates)} fallback)")
+					candidate_filenames = [x[1] for x in candidates]  # Extract just the filenames
 					yield DownloadEvent(kind="files_list", files_list=candidate_filenames, message=f"Found {len(candidate_filenames)} candidate files")
 					
 					# Wait for client confirmation before starting download
@@ -408,317 +336,177 @@ class SoulseekService:
 					# Track users that have already failed to avoid retrying them
 					failed_users = set()
 					
-					# Combine primary candidates with fallback candidates
-					all_candidates_to_try = candidates + fallback_candidates
-					
 					# Check if all candidates are from the same user
-					unique_users_in_candidates = set(x[0] for x in all_candidates_to_try)
+					unique_users_in_candidates = set(x[0] for x in candidates)
 					if len(unique_users_in_candidates) == 1:
 						only_user = list(unique_users_in_candidates)[0]
-						yield DownloadEvent(kind="status", message=f"Warning: All {len(all_candidates_to_try)} candidates are from the same user ({only_user}). If this user fails, no alternatives available.")
-					else:
-						print(f"[DOWNLOAD] ✅ Have candidates from {len(unique_users_in_candidates)} unique user(s) to try")
+						yield DownloadEvent(kind="status", message=f"Warning: All {len(candidates)} candidates are from the same user ({only_user}). If this user fails, no alternatives available.")
 					
-					# Filter out already failed users
-					remaining_candidates = [c for c in all_candidates_to_try if c[0] not in failed_users]
-					
-					# Split into batches of 5 for parallel download attempts
-					BATCH_SIZE = 5
 					candidates_tried = 0
-					finished_success = False
-					
-					# Process candidates in batches
-					for batch_start in range(0, len(remaining_candidates), BATCH_SIZE):
-						if finished_success:
-							break
+					for idx, (username, filename, size, ext, sim) in enumerate(candidates, 1):
+						# Skip users that have already failed
+						if username in failed_users:
+							yield DownloadEvent(kind="status", message=f"candidate #{idx}: {username} | {ext} | {size} (skipping - already failed)")
+							continue
 						
-						batch = remaining_candidates[batch_start:batch_start + BATCH_SIZE]
-						batch_num = (batch_start // BATCH_SIZE) + 1
-						total_batches = (len(remaining_candidates) + BATCH_SIZE - 1) // BATCH_SIZE
+						candidates_tried += 1
+						yield DownloadEvent(kind="status", message=f"candidate #{idx}: {username} | {ext} | {size}")
+						progress_started = asyncio.Event()
+						complete_or_removed = asyncio.Event()
+						last_percent: Optional[int] = None
+						finished = False
+						started_sent = False
+						finished_success = False
+						queued_notified = False
+
+						# Create a queue for download events that will be yielded
+						download_queue: asyncio.Queue[DownloadEvent] = asyncio.Queue(maxsize=1000)
 						
-						print(f"[DOWNLOAD] 📦 Batch {batch_num}/{total_batches}: Attempting {len(batch)} candidate(s) in parallel")
-						yield DownloadEvent(kind="status", message=f"Batch {batch_num}/{total_batches}: Trying {len(batch)} candidate(s) in parallel")
-						
-						# Create download tasks for this batch
-						download_tasks = []
-						task_info = {}  # Map task to (username, filename, idx)
-						
-						for idx, (username, filename, size, ext, sim) in enumerate(batch, batch_start + 1):
-							candidates_tried += 1
-							print(f"[DOWNLOAD] 🔄 Candidate #{idx}: {username} | {ext} | {size} bytes")
-							
-							async def download_single_candidate(candidate_data, client_ref):
-								"""Download a single candidate and return events via queue"""
-								nonlocal finished_success
-								c_username, c_filename, c_size, c_ext, c_sim, c_idx = candidate_data
-								
-								# Skip if another download already succeeded
+						async def _finish_if_needed(transfer, curr_bytes: int):
+							nonlocal last_percent, finished, finished_success, username
+							fs = transfer.filesize or 0
+							# Also verify local file size when available
+							local_ok = False
+							try:
+								if transfer.local_path and os.path.exists(transfer.local_path):
+									local_size = os.path.getsize(transfer.local_path)
+									local_ok = fs > 0 and local_size >= fs
+							except Exception:
+								pass
+							if fs > 0 and curr_bytes >= fs and (last_percent or 0) < 100:
+								last_percent = 100
+								await download_queue.put(DownloadEvent(kind="progress", percent=100, message="100%"))
+								# Treat full bytes as success even if remote flags failure
+								finished_success = True
+							# If we already printed 100% earlier, or local file size matches, mark success
+							if (last_percent or 0) >= 100 or local_ok:
+								finished_success = True
+							if not finished:
+								finished = True
 								if finished_success:
-									return None, None, None, False
-								
-								progress_started = asyncio.Event()
-								complete_or_removed = asyncio.Event()
-								last_percent: Optional[int] = None
-								finished = False
-								started_sent = False
-								c_finished_success = False
-								queued_notified = False
-								
-								# Create a queue for download events
-								download_queue: asyncio.Queue[DownloadEvent] = asyncio.Queue(maxsize=1000)
-								transfer_obj = None
-								
-								async def _finish_if_needed(transfer, curr_bytes: int):
-									nonlocal last_percent, finished, c_finished_success, c_username
-									fs = transfer.filesize or 0
-									local_ok = False
-									try:
-										if transfer.local_path and os.path.exists(transfer.local_path):
-											local_size = os.path.getsize(transfer.local_path)
-											local_ok = fs > 0 and local_size >= fs
-									except Exception:
-										pass
-									if fs > 0 and curr_bytes >= fs and (last_percent or 0) < 100:
-										last_percent = 100
-										await download_queue.put(DownloadEvent(kind="progress", percent=100, message="100%"))
-										c_finished_success = True
-									if (last_percent or 0) >= 100 or local_ok:
-										c_finished_success = True
-									if not finished:
-										finished = True
-										if c_finished_success:
-											await download_queue.put(DownloadEvent(kind="finished", path=transfer.local_path or ""))
-										else:
-											failed_users.add(c_username)
-											await download_queue.put(DownloadEvent(kind="status", message=f"failed from {c_username}"))
-										complete_or_removed.set()
+									await download_queue.put(DownloadEvent(kind="finished", path=transfer.local_path or ""))
+								else:
+									failed_users.add(username)
+									await download_queue.put(DownloadEvent(kind="status", message="failed, trying next"))
+								complete_or_removed.set()
 
-								async def on_removed_t(event: TransferRemovedEvent):
-									if event.transfer.username == c_username and event.transfer.remote_path == c_filename:
-										await _finish_if_needed(event.transfer, event.transfer.bytes_transfered)
+						async def on_removed_t(event: TransferRemovedEvent):
+							if event.transfer.username == username and event.transfer.remote_path == filename:
+								await _finish_if_needed(event.transfer, event.transfer.bytes_transfered)
 
-								async def on_progress_t(event: TransferProgressEvent):
-									nonlocal started_sent, last_percent, queued_notified
-									for transfer, prev, curr in event.updates:
-										if transfer.username != c_username or transfer.remote_path != c_filename:
-											continue
-										fs = transfer.filesize or 0
-										if curr.state == TransferState.State.QUEUED and not queued_notified:
-											queued_notified = True
-											await download_queue.put(DownloadEvent(kind="status", message=f"{c_username} queued"))
-										if (curr.bytes_transfered > 0 or curr.state == TransferState.State.DOWNLOADING) and not progress_started.is_set():
-											progress_started.set()
-											if not started_sent:
-												started_sent = True
-												print(f"[DOWNLOAD] ✅ Candidate #{c_idx} ({c_username}) started downloading")
-												await download_queue.put(DownloadEvent(kind="started", path=transfer.local_path or ""))
-										if fs > 0 and curr.bytes_transfered >= 0:
-											percent = int((curr.bytes_transfered / fs) * 100)
-											percent = max(1, min(100, percent))
-											prev_p = 0 if last_percent is None else last_percent
-											if percent > prev_p:
-												for p in range(prev_p + 1, percent + 1):
-													await download_queue.put(DownloadEvent(kind="progress", percent=p, message=f"{p}%"))
-												last_percent = percent
-										if curr.state in (TransferState.State.COMPLETE, TransferState.State.INCOMPLETE, TransferState.State.ABORTED, TransferState.State.FAILED):
-											finished_success_local = (curr.state == TransferState.State.COMPLETE) or (fs > 0 and curr.bytes_transfered >= fs)
-											if finished_success_local:
-												c_finished_success = True
-											progress_started.set()
-											await _finish_if_needed(transfer, curr.bytes_transfered)
+						async def on_progress_t(event: TransferProgressEvent):
+							nonlocal started_sent, last_percent, queued_notified
+							for transfer, prev, curr in event.updates:
+								if transfer.username != username or transfer.remote_path != filename:
+									continue
+								fs = transfer.filesize or 0
+								# Notify queued state
+								if curr.state == TransferState.State.QUEUED and not queued_notified:
+									queued_notified = True
+									await download_queue.put(DownloadEvent(kind="status", message="queued at source"))
+								if (curr.bytes_transfered > 0 or curr.state == TransferState.State.DOWNLOADING) and not progress_started.is_set():
+									progress_started.set()
+									if not started_sent:
+										started_sent = True
+										await download_queue.put(DownloadEvent(kind="started", path=transfer.local_path or ""))
+								if fs > 0 and curr.bytes_transfered >= 0:
+									percent = int((curr.bytes_transfered / fs) * 100)
+									percent = max(1, min(100, percent))
+									prev_p = 0 if last_percent is None else last_percent
+									if percent > prev_p:
+										for p in range(prev_p + 1, percent + 1):
+											await download_queue.put(DownloadEvent(kind="progress", percent=p, message=f"{p}%"))
+										last_percent = percent
+								if curr.state in (
+									TransferState.State.COMPLETE,
+									TransferState.State.INCOMPLETE,
+									TransferState.State.ABORTED,
+									TransferState.State.FAILED,
+								):
+									# mark success only on COMPLETE or full bytes
+									finished_success_local = (curr.state == TransferState.State.COMPLETE) or (fs > 0 and curr.bytes_transfered >= fs)
+									if finished_success_local:
+										finished_success = True
+									progress_started.set()
+									await _finish_if_needed(transfer, curr.bytes_transfered)
 
-								client_ref.events.register(TransferRemovedEvent, on_removed_t)
-								client_ref.events.register(TransferProgressEvent, on_progress_t)
+						client.events.register(TransferRemovedEvent, on_removed_t)
+						client.events.register(TransferProgressEvent, on_progress_t)
 
-								try:
-									transfer_obj = await client_ref.transfers.download(c_username, c_filename)
-								except Exception as download_error:
-									error_str = str(download_error)
-									error_type = type(download_error).__name__
-									if 'PeerConnectionError' in error_type or 'peer' in error_str.lower() or 'connection' in error_str.lower():
-										client_ref.events.unregister(TransferRemovedEvent, on_removed_t)
-										client_ref.events.unregister(TransferProgressEvent, on_progress_t)
-										failed_users.add(c_username)
-										print(f"[DOWNLOAD] ❌ Candidate #{c_idx} ({c_username}): Connection failed")
-										return None, None, None, False
-									else:
-										raise
-								
-								# Return immediately with progress event - monitoring will continue in background
-								# The caller will wait for progress_started to be set
-								
-								# Start monitoring in background
-								async def monitor_download():
-									nonlocal c_finished_success
-									queued_and_stuck = asyncio.Event()
-									
-									async def monitor_queue():
-										await asyncio.sleep(3.0)
-										if queued_notified and not progress_started.is_set():
-											queued_and_stuck.set()
-									
-									monitor_task = asyncio.create_task(monitor_queue())
-									
-									try:
-										done, pending = await asyncio.wait(
-											[asyncio.create_task(progress_started.wait()), monitor_task],
-											timeout=10.0,
-											return_when=asyncio.FIRST_COMPLETED
-										)
-										
-										for task in pending:
-											task.cancel()
-											try:
-												await task
-											except asyncio.CancelledError:
-												pass
-										
-										if queued_and_stuck.is_set():
-											await client_ref.transfers.abort(transfer_obj)
-											client_ref.events.unregister(TransferRemovedEvent, on_removed_t)
-											client_ref.events.unregister(TransferProgressEvent, on_progress_t)
-											failed_users.add(c_username)
-											print(f"[DOWNLOAD] ⏱️  Candidate #{c_idx} ({c_username}): Stuck in queue, aborting")
-											return
-										
-										if not progress_started.is_set():
-											await client_ref.transfers.abort(transfer_obj)
-											client_ref.events.unregister(TransferRemovedEvent, on_removed_t)
-											client_ref.events.unregister(TransferProgressEvent, on_progress_t)
-											failed_users.add(c_username)
-											print(f"[DOWNLOAD] ⏱️  Candidate #{c_idx} ({c_username}): Timeout, aborting")
-											return
-									except asyncio.TimeoutError:
-										await client_ref.transfers.abort(transfer_obj)
-										client_ref.events.unregister(TransferRemovedEvent, on_removed_t)
-										client_ref.events.unregister(TransferProgressEvent, on_progress_t)
-										failed_users.add(c_username)
-										print(f"[DOWNLOAD] ⏱️  Candidate #{c_idx} ({c_username}): Timeout exception, aborting")
-										return
-									
-									# If we get here, download started - continue monitoring until completion
-									# The main loop will handle streaming events
-								
-								# Start monitoring in background
-								asyncio.create_task(monitor_download())
-								
-								# Return immediately with progress event
-								return download_queue, transfer_obj, progress_started, c_finished_success
-							
-							# Create task for this candidate
-							task = asyncio.create_task(download_single_candidate((username, filename, size, ext, sim, idx), client))
-							download_tasks.append(task)
-							task_info[task] = (username, filename, idx)
+						transfer = await client.transfers.download(username, filename)
 						
-						# Wait for first successful download or all to fail
-						successful_queue = None
-						successful_transfer = None
-						successful_progress_event = None
+						# Track if we detected queued state
+						queued_and_stuck = asyncio.Event()
 						
-						# Map progress events to their tasks
-						progress_to_task = {}
-						progress_events = []
+						# Monitor for queued state - if stuck in queue for more than 3 seconds, skip
+						async def monitor_queue():
+							await asyncio.sleep(3.0)  # Wait 3 seconds
+							# If still queued and hasn't started downloading, it's stuck
+							if queued_notified and not progress_started.is_set():
+								queued_and_stuck.set()
+						
+						monitor_task = asyncio.create_task(monitor_queue())
 						
 						try:
-							# Wait for all tasks to initiate downloads and return their progress events
-							done_init, pending_init = await asyncio.wait(download_tasks, timeout=5.0, return_when=asyncio.ALL_COMPLETED)
+							# Wait for progress to start, with shorter timeout (10 seconds instead of 30)
+							done, pending = await asyncio.wait(
+								[asyncio.create_task(progress_started.wait()), monitor_task],
+								timeout=10.0,
+								return_when=asyncio.FIRST_COMPLETED
+							)
 							
-							# Collect progress events from all tasks
-							for task in download_tasks:
+							# Cancel monitor task if progress started
+							for task in pending:
+								task.cancel()
 								try:
-									queue, transfer, progress_evt, success = await task
-									if progress_evt is not None and transfer is not None:
-										progress_events.append(progress_evt)
-										progress_to_task[progress_evt] = (task, queue, transfer)
-										print(f"[DOWNLOAD] 📋 Candidate #{task_info[task][2]} initialized, waiting for download to start...")
-									elif transfer is None:
-										print(f"[DOWNLOAD] ❌ Candidate #{task_info[task][2]} failed to initialize")
-								except Exception as e:
-									print(f"[DOWNLOAD] ⚠️  Task error for candidate #{task_info[task][2]}: {e}")
+									await task
+								except asyncio.CancelledError:
+									pass
 							
-							# If we have progress events, wait for one to start downloading
-							if progress_events:
-								print(f"[DOWNLOAD] ⏳ Waiting for one of {len(progress_events)} candidate(s) to start downloading...")
-								yield DownloadEvent(kind="status", message=f"Waiting for one of {len(progress_events)} candidate(s) to start...")
-								
-								done_progress, pending_progress = await asyncio.wait(
-									[asyncio.create_task(ev.wait()) for ev in progress_events],
-									timeout=15.0,
-									return_when=asyncio.FIRST_COMPLETED
-								)
-								
-								# Find which progress event fired
-								found_successful = False
-								for progress_evt in progress_events:
-									if progress_evt.is_set():
-										task, queue, transfer = progress_to_task[progress_evt]
-										if queue is not None and transfer is not None:
-											successful_queue = queue
-											successful_transfer = transfer
-											successful_progress_event = progress_evt
-											found_successful = True
-											print(f"[DOWNLOAD] 🎯 Candidate #{task_info[task][2]} ({task_info[task][0]}) started - aborting others")
-											
-											# Abort all other transfers
-											for other_progress_evt, (other_task, other_queue, other_transfer) in progress_to_task.items():
-												if other_progress_evt != progress_evt and other_transfer is not None:
-													try:
-														await client.transfers.abort(other_transfer)
-														print(f"[DOWNLOAD] 🛑 Aborted candidate #{task_info[other_task][2]}")
-													except Exception as abort_err:
-														print(f"[DOWNLOAD] ⚠️  Failed to abort candidate #{task_info[other_task][2]}: {abort_err}")
-											
-											# Stream events from successful download
-											while True:
-												try:
-													ev = await asyncio.wait_for(successful_queue.get(), timeout=0.5)
-													yield ev
-													if ev.kind == "finished":
-														finished_success = True
-														print(f"[DOWNLOAD] ✅ Download completed successfully")
-														break
-													if ev.kind == "status" and "failed" in ev.message:
-														print(f"[DOWNLOAD] ❌ Download failed: {ev.message}")
-														failed_users.add(task_info[task][0])
-														break
-												except asyncio.TimeoutError:
-													# Check if download is still active
-													if successful_progress_event.is_set():
-														continue
-													else:
-														# Download stopped
-														break
-											
-											# Drain remaining events
-											while not successful_queue.empty():
-												try:
-													ev = await asyncio.wait_for(successful_queue.get(), timeout=0.1)
-													yield ev
-													if ev.kind == "finished":
-														finished_success = True
-												except asyncio.TimeoutError:
-													break
-											
-											if finished_success:
-												break
-								
-								if not found_successful:
-									print(f"[DOWNLOAD] ❌ Batch {batch_num}: No candidate started downloading within timeout")
-							else:
-								# No progress events - all failed to initialize
-								print(f"[DOWNLOAD] ❌ Batch {batch_num}: All candidates failed to initialize")
-						except Exception as e:
-							print(f"[DOWNLOAD] ⚠️  Batch {batch_num} error: {e}")
-							import traceback
-							traceback.print_exc()
-						
-						# If this batch didn't succeed, continue to next batch
-						if not finished_success:
-							print(f"[DOWNLOAD] ❌ Batch {batch_num}: No successful download, trying next batch")
+							# If stuck in queue, skip immediately
+							if queued_and_stuck.is_set():
+								await client.transfers.abort(transfer)
+								client.events.unregister(TransferRemovedEvent, on_removed_t)
+								client.events.unregister(TransferProgressEvent, on_progress_t)
+								failed_users.add(username)
+								yield DownloadEvent(kind="status", message=f"{username} stuck in queue, skipping")
+								continue
+							
+							# If progress didn't start, timeout
+							if not progress_started.is_set():
+								await client.transfers.abort(transfer)
+								client.events.unregister(TransferRemovedEvent, on_removed_t)
+								client.events.unregister(TransferProgressEvent, on_progress_t)
+								failed_users.add(username)
+								yield DownloadEvent(kind="status", message=f"start timeout from {username}, trying next")
+								continue
+						except asyncio.TimeoutError:
+							await client.transfers.abort(transfer)
+							client.events.unregister(TransferRemovedEvent, on_removed_t)
+							client.events.unregister(TransferProgressEvent, on_progress_t)
+							failed_users.add(username)
+							yield DownloadEvent(kind="status", message=f"start timeout from {username}, trying next")
+							continue
+
+						# While downloading, stream events to caller in real-time
+						while not complete_or_removed.is_set():
+							try:
+								ev = await asyncio.wait_for(download_queue.get(), timeout=0.2)
+								yield ev
+							except asyncio.TimeoutError:
+								pass
+						# Drain remaining events
+						while not download_queue.empty():
+							ev = await download_queue.get()
+							yield ev
+						client.events.unregister(TransferRemovedEvent, on_removed_t)
+						client.events.unregister(TransferProgressEvent, on_progress_t)
+						if finished_success:
+							break
+						# else try next candidate
 					
 					# If we've tried all candidates and all failed
 					if candidates_tried > 0 and len(failed_users) >= len(unique_users_in_candidates) and not finished_success:
-						# Only send event to client, don't print (client will handle logging)
 						yield DownloadEvent(kind="error", message=f"All {len(unique_users_in_candidates)} unique user(s) failed. Tried {candidates_tried} candidate(s) total. No more options available from search results.")
 						return
 				break  # Successfully connected and completed
