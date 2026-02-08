@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import time
 from threading import Thread
 from typing import Dict, Any
@@ -57,15 +58,26 @@ def http_start_download():
 	preferred_format = data.get("format", "").strip().lower()  # "mp3" or "flac"
 	if preferred_format and preferred_format not in ("mp3", "flac"):
 		preferred_format = None
-	
-	svc = SoulseekService(USERNAME, PASSWORD, DOWNLOAD_DIR, search_timeout=10)
+
+	# Get search_timeout from request, default to 10 seconds
+	search_timeout = data.get("search_timeout", 10)
+	if not isinstance(search_timeout, int) or search_timeout < 5:
+		search_timeout = 10
+	if search_timeout > 60:
+		search_timeout = 60  # Cap at 60 seconds
+
+	svc = SoulseekService(USERNAME, PASSWORD, DOWNLOAD_DIR, search_timeout=search_timeout, job_id=job_id)
 
 	async def run_job():
 		format_msg = f" (preferred: {preferred_format})" if preferred_format else ""
 		print(f"[JOB {job_id}] Starting download for: {query}{format_msg}")
 		try:
 			async for ev in svc.download(query, preferred_format=preferred_format if preferred_format else None, confirmation_event=confirmation_event):
-				print(f"[JOB {job_id}] Event received: {ev.kind} - {ev.message}")
+				# Log events - progress on same line, others on new line
+				if ev.kind == "progress":
+					print(f"\r[JOB {job_id}] Downloading: {ev.percent}%", end="", flush=True)
+				else:
+					print(f"\n[JOB {job_id}] {ev.kind}: {ev.message}")
 				# Track path/finished for streaming
 				if ev.kind == "started" and ev.path:
 					_jobs[job_id]["path"] = ev.path
@@ -74,7 +86,6 @@ def http_start_download():
 				# Enqueue for WS consumers
 				try:
 					await queue.put(ev.__dict__)
-					print(f"[JOB {job_id}] Event enqueued: {ev.kind}")
 				except asyncio.CancelledError:
 					print(f"[JOB {job_id}] Cancelled")
 					break
@@ -116,21 +127,18 @@ def on_subscribe(data):
 	
 	# Start background task to drain queue
 	def send_events():
-		print(f"[WS] Background task started for job {job_id}")
 		while True:
 			try:
-				print(f"[WS] Waiting for queue item...")
 				item = asyncio.run_coroutine_threadsafe(queue.get(), _loop).result(timeout=60)
-				print(f"[WS] Got item from queue: {item.get('kind')}")
 				socketio.emit("progress", item, room=sid)
-				print(f"[WS] Sent event: {item.get('kind')}")
 				if item.get("kind") == "finished":
-					print(f"[WS] Job finished, stopping background task")
+					print(f"[WS] Job {job_id} finished")
+					break
+				elif item.get("kind") == "error":
+					print(f"[WS] Job {job_id} error: {item.get('message')}")
 					break
 			except Exception as e:
-				print(f"[WS] Error in loop: {e}")
-				import traceback
-				traceback.print_exc()
+				print(f"[WS] Error in job {job_id}: {e}")
 				break
 	
 	socketio.start_background_task(send_events)
@@ -148,8 +156,8 @@ def on_confirm_download(data):
 	confirmation_event = job.get("confirmation")
 	if confirmation_event:
 		job["confirmed"] = True
-		# Signal the confirmation event in the event loop
-		asyncio.run_coroutine_threadsafe(confirmation_event.set(), _loop)
+		# Signal the confirmation event in the event loop (set() is not a coroutine, use call_soon_threadsafe)
+		_loop.call_soon_threadsafe(confirmation_event.set)
 		print(f"[WS] Download confirmed for job: {job_id}")
 		emit("progress", {"kind": "status", "message": "Download confirmed, starting..."}, room=sid)
 	else:
@@ -161,11 +169,20 @@ def http_stream_file(job_id: str):
 	if not job:
 		return {"error": "unknown job_id"}, 404
 
+	def cleanup_job_dir():
+		"""Delete the job subdirectory after streaming is complete"""
+		job_subdir = os.path.join(DOWNLOAD_DIR, job_id)
+		if os.path.exists(job_subdir) and os.path.isdir(job_subdir):
+			try:
+				shutil.rmtree(job_subdir)
+				print(f"[STREAM] Deleted job directory after streaming: {job_subdir}")
+			except Exception as e:
+				print(f"[STREAM] Error deleting job directory {job_subdir}: {e}")
+
 	def generate():
 		current_path = None
 		pos = 0
 		last_growth = time.time()
-		file_to_delete = None
 		try:
 			while True:
 				# Switch to latest path if changed
@@ -173,8 +190,6 @@ def http_stream_file(job_id: str):
 				if latest and latest != current_path:
 					current_path = latest
 					pos = 0
-					# Track the file path for deletion
-					file_to_delete = current_path if os.path.isabs(current_path) else os.path.join(DOWNLOAD_DIR, os.path.basename(current_path))
 				# If we don't yet have a path and not finished, wait
 				if not current_path and not job.get("finished"):
 					time.sleep(0.1)
@@ -210,15 +225,11 @@ def http_stream_file(job_id: str):
 						break
 					time.sleep(0.2)
 		finally:
-			# Delete the file after streaming is complete
-			if file_to_delete and os.path.exists(file_to_delete):
-				try:
-					os.remove(file_to_delete)
-					print(f"[STREAM] Deleted file after streaming: {file_to_delete}")
-				except Exception as e:
-					print(f"[STREAM] Error deleting file {file_to_delete}: {e}")
+			cleanup_job_dir()
 
-	return Response(stream_with_context(generate()), mimetype="application/octet-stream")
+	response = Response(stream_with_context(generate()), mimetype="application/octet-stream")
+	response.call_on_close(cleanup_job_dir)
+	return response
 
 if __name__ == "__main__":
 	port = int(os.environ.get("PORT", 8001))
