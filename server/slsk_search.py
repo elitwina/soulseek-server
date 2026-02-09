@@ -111,12 +111,23 @@ async def perform_search(
 	client.events.unregister(SearchRequestRemovedEvent, on_removed)
 
 	if not collected:
-		print(f"[SEARCH] ❌ No results found for: '{query}'")
+		print(f"\033[91m[SEARCH] ❌ No results found for: '{query}'\033[0m")
 		return [], [], []
 
 	# Log how many results we collected
 	unique_users_collected = len(set(x[0] for x in collected))
-	print(f"[SEARCH] ✅ Search completed: Found {len(collected)} file(s) from {unique_users_collected} unique user(s)")
+	print(f"\033[92m[SEARCH] ✅ Search completed: Found {len(collected)} file(s) from {unique_users_collected} unique user(s)\033[0m")
+
+	# Print ALL raw results in color for debugging
+	print(f"\033[96m{'='*80}\033[0m")
+	print(f"\033[96m[SEARCH] 📋 ALL RAW RESULTS ({len(collected)} files):\033[0m")
+	print(f"\033[96m{'='*80}\033[0m")
+	for i, (username, filename, fsize, ext) in enumerate(collected, 1):
+		size_mb = fsize / (1024 * 1024)
+		print(f"\033[93m[{i}] User: {username}\033[0m")
+		print(f"    \033[97mFile: {filename}\033[0m")
+		print(f"    \033[94mSize: {size_mb:.2f} MB | Ext: {ext}\033[0m")
+	print(f"\033[96m{'='*80}\033[0m")
 	if event_queue:
 		await event_queue.put(DownloadEvent(kind="status", message=f"Collected {len(collected)} files from {unique_users_collected} unique user(s)"))
 

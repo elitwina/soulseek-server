@@ -88,6 +88,9 @@ def http_start_download():
 					_jobs[job_id]["path"] = ev.path
 				elif ev.kind == "finished":
 					_jobs[job_id]["finished"] = True
+					# Also update path from finished event if available
+					if ev.path:
+						_jobs[job_id]["path"] = ev.path
 				# Enqueue for WS consumers
 				try:
 					await queue.put(ev.__dict__)
@@ -132,11 +135,11 @@ def on_subscribe(data):
 	if not job_id or job_id not in _jobs:
 		emit("error", {"kind": "error", "message": "unknown job_id"})
 		return
-	
+
 	_job_sids[job_id] = sid
 	print(f"[WS] Connected to job: {job_id}")
 	queue: asyncio.Queue = _jobs[job_id]["queue"]
-	
+
 	# Start background task to drain queue
 	def send_events():
 		while True:
@@ -152,7 +155,7 @@ def on_subscribe(data):
 			except Exception as e:
 				print(f"[WS] Error in job {job_id}: {e}")
 				break
-	
+
 	socketio.start_background_task(send_events)
 
 @socketio.on("confirm_download")
@@ -216,11 +219,14 @@ def http_stream_file(job_id: str):
 		current_path = None
 		pos = 0
 		last_growth = time.time()
+		print(f"[STREAM] Starting generate() for job {job_id}")
+		print(f"[STREAM] Job state: path={job.get('path')}, finished={job.get('finished')}")
 		try:
 			while True:
 				# Switch to latest path if changed
 				latest = job.get("path")
 				if latest and latest != current_path:
+					print(f"[STREAM] Switching to path: {latest}")
 					current_path = latest
 					pos = 0
 				# If we don't yet have a path and not finished, wait
@@ -228,6 +234,7 @@ def http_stream_file(job_id: str):
 					time.sleep(0.1)
 					continue
 				if not current_path and job.get("finished"):
+					print(f"[STREAM] No path and finished=True, breaking with 0 bytes")
 					break
 
 				abs_path = current_path if os.path.isabs(current_path) else os.path.join(DOWNLOAD_DIR, os.path.basename(current_path))
@@ -253,11 +260,14 @@ def http_stream_file(job_id: str):
 							else:
 								time.sleep(0.2)
 				except FileNotFoundError:
+					print(f"[STREAM] FileNotFoundError for path: {abs_path}")
 					# If switched to a new path or not yet created, wait
 					if job.get("finished") and job.get("path") == current_path:
+						print(f"[STREAM] File not found and job finished, breaking")
 						break
 					time.sleep(0.2)
 		finally:
+			print(f"[STREAM] Finished streaming, total bytes sent from pos: {pos}")
 			cleanup_job_dir()
 
 	response = Response(stream_with_context(generate()), mimetype="application/octet-stream")
@@ -267,4 +277,3 @@ def http_stream_file(job_id: str):
 if __name__ == "__main__":
 	port = int(os.environ.get("PORT", 8001))
 	socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
-

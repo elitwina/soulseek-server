@@ -348,7 +348,8 @@ def _is_perfect_match(filename: str, size: int, ext: str, sim: float, preferred_
 	"""Check if a file is a PERFECT match that we should start downloading immediately.
 
 	Rules:
-	- Similarity must be >= 0.60
+	- Similarity must be >= 0.75 (high threshold to avoid wrong songs)
+	- If query has artist (contains " - "), artist name must appear in filename
 	- Must not contain unwanted version keywords (remix, live, etc.) unless query has them
 	- If user wants MP3: ONLY MP3 320 is perfect
 	- If user wants FLAC: ONLY FLAC is perfect
@@ -358,9 +359,20 @@ def _is_perfect_match(filename: str, size: int, ext: str, sim: float, preferred_
 	"""
 	ext = ext.lower()
 
-	# Similarity threshold for perfect match
-	if sim < 0.60:
+	# Similarity threshold for perfect match - high threshold to avoid downloading wrong songs
+	if sim < 0.75:
 		return False
+
+	# If query has artist (Artist - Title format), verify artist appears in filename
+	if query and " - " in query:
+		artist = query.split(" - ")[0].strip().lower()
+		filename_lower = filename.lower()
+		# Check if at least the first word of the artist name appears in the filename
+		artist_words = artist.split()
+		if artist_words:
+			first_artist_word = artist_words[0]
+			if len(first_artist_word) >= 3 and first_artist_word not in filename_lower:
+				return False  # Artist doesn't appear in filename - not a perfect match
 
 	# Filter out unwanted versions (remix, live, etc.)
 	if query and _has_unwanted_version(filename, query):

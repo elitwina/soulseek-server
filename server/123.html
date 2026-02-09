@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="he">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OS / Browser Info</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; padding: 16px; }
+    pre { background: #f6f6f6; padding: 12px; border-radius: 8px; overflow: auto; }
+    .muted { color: #666; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h2>Device / OS / Browser Info</h2>
+  <div class="muted">פותח בדפדפן ורואה מה באמת זמין. (חלק מהשדות תלויים בדפדפן)</div>
+  <pre id="out">Loading...</pre>
+
+  <script>
+    (async () => {
+      const out = document.getElementById("out");
+
+      const nav = navigator;
+      const uaData = nav.userAgentData;
+
+      const info = {
+        time: new Date().toString(),
+
+        // Classic
+        userAgent: nav.userAgent,
+        platform: nav.platform, // legacy, often less reliable today
+        language: nav.language,
+        languages: nav.languages,
+        cookieEnabled: nav.cookieEnabled,
+        doNotTrack: nav.doNotTrack,
+
+        // Hardware-ish (still not super precise)
+        hardwareConcurrency: nav.hardwareConcurrency, // CPU cores (rough)
+        deviceMemoryGB: nav.deviceMemory, // Chrome-based only, approx
+        maxTouchPoints: nav.maxTouchPoints,
+
+        // Screen / viewport
+        screen: {
+          width: screen.width,
+          height: screen.height,
+          availWidth: screen.availWidth,
+          availHeight: screen.availHeight,
+          colorDepth: screen.colorDepth,
+          pixelDepth: screen.pixelDepth,
+          devicePixelRatio: window.devicePixelRatio
+        },
+        viewport: {
+          innerWidth: window.innerWidth,
+          innerHeight: window.innerHeight
+        },
+
+        // UA Client Hints (best effort)
+        userAgentDataSupported: !!uaData,
+        userAgentData: uaData ? {
+          platform: uaData.platform,
+          mobile: uaData.mobile,
+          // "architecture" isn't always present unless requested / supported
+          architecture: uaData.architecture,
+          bitness: uaData.bitness,
+          model: uaData.model,
+          brands: uaData.brands,
+          fullVersionList: uaData.fullVersionList
+        } : null,
+
+        // High-entropy hints (if supported and allowed)
+        highEntropy: null,
+
+        // Basic derived guess (best-effort)
+        derived: {}
+      };
+
+      // Try high entropy values when available (Chromium usually)
+      if (uaData && uaData.getHighEntropyValues) {
+        try {
+          const hev = await uaData.getHighEntropyValues([
+            "platform", "platformVersion", "architecture", "bitness",
+            "model", "uaFullVersion", "fullVersionList"
+          ]);
+          info.highEntropy = hev;
+        } catch (e) {
+          info.highEntropy = { error: String(e) };
+        }
+      }
+
+      // Simple OS detection fallback from UA
+      const ua = nav.userAgent || "";
+      let os = "unknown";
+      if (/Windows NT/i.test(ua)) os = "windows";
+      else if (/Mac OS X/i.test(ua)) os = "macos";
+      else if (/Android/i.test(ua)) os = "android";
+      else if (/iPhone|iPad|iPod/i.test(ua)) os = "ios";
+      else if (/Linux/i.test(ua)) os = "linux";
+
+      info.derived.osGuess = os;
+
+      // Try to guess Apple Silicon vs Intel if possible (best effort)
+      let macArchGuess = null;
+      if (os === "macos") {
+        if (info.highEntropy?.architecture) macArchGuess = info.highEntropy.architecture;
+        else if (uaData?.architecture) macArchGuess = uaData.architecture;
+        else if (/arm|aarch64/i.test(ua)) macArchGuess = "arm";
+        else macArchGuess = "unknown";
+      }
+      info.derived.macArchitectureGuess = macArchGuess;
+
+      out.textContent = JSON.stringify(info, null, 2);
+    })();
+  </script>
+</body>
+</html>
