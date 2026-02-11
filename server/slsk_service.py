@@ -151,6 +151,12 @@ def _basename_without_ext(path: str) -> str:
 	return base.rsplit(".", 1)[0] if "." in base else base
 
 
+def _basename_from_path(full_path: str) -> str:
+	"""Return only the filename (last path component) for display/comparison. Soulseek paths use backslash."""
+	parts = full_path.replace("\\", "/").split("/")
+	return parts[-1].strip() if parts else full_path
+
+
 def _normalize_search_query(query: str) -> str:
 	"""Normalize query for better Soulseek search results.
 
@@ -979,8 +985,8 @@ class SoulseekService:
 						yield DownloadEvent(kind="error", message="No suitable candidates found after filtering")
 						return
 
-					# Send list of candidate file names to client for existence check
-					candidate_filenames = [x[1] for x in candidates]
+					# Send only basenames (no paths) so client can compare e.g. "Mau P - neck (Extended Mix).flac" with query
+					candidate_filenames = [_basename_from_path(x[1]) for x in candidates]
 					yield DownloadEvent(kind="files_list", files_list=candidate_filenames, message=f"Found {len(candidate_filenames)} candidate files")
 
 					# Wait for client confirmation before starting download
